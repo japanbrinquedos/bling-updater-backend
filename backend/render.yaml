@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bling-updater-backend
+    env: node
+    plan: free
+    buildCommand: "npm install && npm run build"
+    startCommand: "node dist/server.js"
+    healthCheckPath: "/health"
+    autoDeploy: true

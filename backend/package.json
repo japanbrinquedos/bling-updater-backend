@@ -1,0 +1,23 @@
+{
+  "name": "bling-updater-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "axios": "1.7.7",
+    "cors": "2.8.5",
+    "dotenv": "16.4.5",
+    "express": "4.19.2",
+    "qs": "6.13.0",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "4.16.2",
+    "typescript": "5.6.2"
+  }
+}
