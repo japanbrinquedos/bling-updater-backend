@@ -23,7 +23,7 @@ import {
 
 export const router = express.Router();
 
-// -------- helper: extrai blocos *...* mesmo com HTML/quebras
+/** Extrai blocos *...* mesmo com HTML/quebras de linha */
 function extractStarBlocksFromJoined(s: string): string[] {
   const text = String(s || '');
   const m = text.match(/\*[\s\S]*?\*/g);
@@ -31,7 +31,7 @@ function extractStarBlocksFromJoined(s: string): string[] {
   return text.split(/\n+/).map(x => x.trim()).filter(Boolean);
 }
 
-// ===== Auth =====
+/* ========================== AUTH ========================== */
 router.get('/auth/status', (_req: Request, res: Response) => {
   res.json({ hasToken: !!getAccessToken(), expiresIn: getExpiresIn(), hasRefresh: true });
 });
@@ -46,7 +46,7 @@ router.get('/auth/start', (_req: Request, res: Response, next: NextFunction) => 
       response_type: 'code',
       client_id: clientId,
       redirect_uri: redirect,
-      state
+      state,
     }).toString();
     res.redirect(authURL.toString());
   } catch (e) { next(e as Error); }
@@ -62,7 +62,7 @@ router.get('/auth/callback', async (req: Request, res: Response, next: NextFunct
   } catch (e) { next(e as Error); }
 });
 
-// ===== BN (Colar & Enviar) =====
+/* ====================== COLAR & ENVIAR ===================== */
 router.post('/bn/parse', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawLines: string[] = ((req.body as any)?.lines || []).map((s: any) => String(s ?? ''));
@@ -72,7 +72,7 @@ router.post('/bn/parse', async (req: Request, res: Response, next: NextFunction)
   } catch (e) { next(e as Error); }
 });
 
-// ===== Buscar & Montar =====
+/* ==================== BUSCAR & MONTAR ===================== */
 router.post('/search/build', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawSeeds: string[] = ((req.body as any)?.seeds || []).map((s: any) => String(s ?? ''));
@@ -84,77 +84,94 @@ router.post('/search/build', async (req: Request, res: Response, next: NextFunct
 
 router.post('/search/fetch', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const items: Array<{ ean?: string; code?: string; name?: string; id?: string | number }> = (req.body as any)?.items || [];
+    const items: Array<{ ean?: string; code?: string; name?: string; id?: string | number }> =
+      (req.body as any)?.items || [];
     const mode: 'safe' | 'fast' = (req.body as any)?.mode || 'safe';
     const out = await fetchEnrichment(items, mode);
     res.json({ items: out });
   } catch (e) { next(e as Error); }
 });
 
-// ===== Bling: PATCH (usa PUT mínimo + PATCH da situação) =====
-// >>> Mantém compatível com o FRONT atual: body = { id, data }
-router.post('/bling/patch', async (req: Request, res: Response, next: NextFunction) => {
+/* ======================== BLING =========================== */
+/** Compatível com o front: body = { id, data } */
+router.post('/bling/patch', async (req: Request, res: Response) => {
+  const token = getAccessToken();
+  if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
+
+  const id = Number(String((req.body as any)?.id ?? '').replace(/\D+/g, ''));
+  const data = (req.body as any)?.data || {};
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
+  }
+
+  // Filtra e converte p/ PT-BR
+  const filtered = PatchPolicy.filterOutgoing(data);
+  const fullBody = toBlingBody(filtered);
+
+  // Bling v3 exige 'tipo' e 'formato' até para update parcial → buscar do produto atual
+  let tipo = 'P';
+  let formato = 'S';
   try {
-    const token = getAccessToken();
-    if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
+    const current = await blingGetProductById(token, id);
+    if (current?.tipo)    tipo = String(current.tipo);
+    if (current?.formato) formato = String(current.formato);
+  } catch {
+    // segue com fallback 'P' e 'S'
+  }
 
-    // aceita id sujo e força dígitos
-    const id = Number(String((req.body as any)?.id ?? '').replace(/\D+/g, ''));
-    const data = (req.body as any)?.data || {};
-    if (!Number.isFinite(id) || id <= 0) {
-      return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
+  // Modo mínimo + requisitos: codigo/nome/preco + tipo/formato
+  const body: any = { tipo, formato };
+  if (fullBody.codigo) body.codigo = fullBody.codigo;
+  if (fullBody.nome)   body.nome   = fullBody.nome;
+  if (typeof fullBody.preco === 'number') body.preco = Number(fullBody.preco.toFixed(2));
+
+  // PUT produto
+  let respProduto: any = null;
+  if (Object.keys(body).length > 0) {
+    try {
+      respProduto = await blingPutProduct(token, id, body);
+    } catch (e) {
+      const err = extractAxiosError(e);
+      return res.status(400).json({ ok: false, stage: 'putProduto', error: err, sentBody: body });
     }
+  }
 
-    // filtra campos não enviados e mapeia para PT-BR
-    const filtered = PatchPolicy.filterOutgoing(data);
-    const body = toBlingBody(filtered);
-
-    let respProduto: any = null;
-    if (Object.keys(body).length > 0) {
-      try {
-        respProduto = await blingPutProduct(token, id, body);
-      } catch (e) {
-        const err = extractAxiosError(e);
-        return res.status(400).json({ ok: false, stage: 'putProduto', error: err });
-      }
+  // PATCH situação (A/I) se vier no front
+  let respStatus: any = null;
+  if (filtered.status === 'A' || filtered.status === 'I') {
+    try {
+      respStatus = await blingPatchSituacao(token, id, filtered.status);
+    } catch (e) {
+      const err = extractAxiosError(e);
+      return res.status(400).json({ ok: false, stage: 'patchSituacao', error: err });
     }
+  }
 
-    let respStatus: any = null;
-    if (filtered.status === 'A' || filtered.status === 'I') {
-      try {
-        respStatus = await blingPatchSituacao(token, id, filtered.status);
-      } catch (e) {
-        const err = extractAxiosError(e);
-        return res.status(400).json({ ok: false, stage: 'patchSituacao', error: err });
-      }
-    }
-
-    res.json({ ok: true, bling: { produto: respProduto, situacao: respStatus } });
-  } catch (e) { next(e as Error); }
+  return res.json({ ok: true, bling: { produto: respProduto, situacao: respStatus } });
 });
 
-// ===== Debug: consultar produto por código ou id =====
-router.get('/debug/product', async (req: Request, res: Response, next: NextFunction) => {
+/* ================ DEBUG: Produto via API Bling ================ */
+router.get('/debug/product', async (req: Request, res: Response) => {
+  const token = getAccessToken();
+  if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
+
+  const code = (req.query.code as string) || '';
+  const idQ = (req.query.id as string) || '';
+
   try {
-    const token = getAccessToken();
-    if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
-
-    const code = (req.query.code as string) || '';
-    const idQ = (req.query.id as string) || '';
-
     if (code) {
       const found = await blingFindProductByCode(token, code);
       if (!found?.id) return res.status(404).json({ ok: false, message: 'Produto não encontrado por código' });
       const full = await blingGetProductById(token, found.id);
       return res.json({ ok: true, summary: found, full });
     }
-
     if (idQ) {
       const full = await blingGetProductById(token, idQ);
       if (!full) return res.status(404).json({ ok: false, message: 'Produto não encontrado por id' });
       return res.json({ ok: true, full });
     }
-
     return res.status(400).json({ ok: false, message: 'Informe ?code= ou ?id=' });
-  } catch (e) { next(e as Error); }
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: String(e) });
+  }
 });
