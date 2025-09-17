@@ -1,7 +1,10 @@
 import axios from 'axios';
 
 // ======== Tipos ========
-export type BNRow = [string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string,string];
+export type BNRow = [
+  string, string, string, string, string, string, string, string, string, string, string,
+  string, string, string, string, string, string, string, string, string, string, string
+];
 
 export interface BNParseItem {
   input: string;
@@ -40,7 +43,7 @@ function stripWrappers(s: string): string {
   // remove aspas e asteriscos nas pontas em qualquer ordem
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) t = t.slice(1, -1).trim();
   if (t.startsWith('*') && t.endsWith('*')) t = t.slice(1, -1).trim();
-  // casos mistos *"..."*
+  // casos mistos *"..."* ou *'...'*
   if ((t.startsWith('*"') && t.endsWith('"*')) || (t.startsWith("*'") && t.endsWith("'*"))) t = t.slice(2, -2).trim();
   return t;
 }
@@ -192,27 +195,31 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       imgs.join(',')                  // 22 Imagens (CSV)
     ];
 
-    // Regras adicionais: peso bruto ≥ líquido
+    // ======== Validações e avisos (corrigido) ========
     const warnings: string[] = [];
-    const pesoLiq = parsePTBRNumber(_22[10].replace(',', '.'));
-    const pesoBru = parsePTBRNumber(_22[11].replace(',', '.'));
+
+    // Peso bruto ≥ líquido (parse simples, respeitando vírgula decimal)
+    const toFloat = (val: string): number | null => {
+      const t = (val || '').trim().replace(',', '.');
+      const n = parseFloat(t);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const pesoLiq = toFloat(_22[10]); // já vem "0,4"
+    const pesoBru = toFloat(_22[11]);
     if (pesoLiq !== null && pesoBru !== null && pesoBru < pesoLiq) {
-      // swap
       const tmp = _22[11];
       _22[11] = _22[10];
       _22[10] = tmp;
       warnings.push('weight_swap: peso_bruto < peso_liquido — valores invertidos');
     }
 
-    // Dims em faixa
-    const dimCols = [13,14,15];
+    // Dimensões dentro da faixa (agora sem falsos positivos)
+    const dimCols = [13, 14, 15];
     for (const i of dimCols) {
-      const val = _22[i];
-      if (val) {
-        const n = parsePTBRNumber(val.replace(',', '.'));
-        if (n && (n < 0.5 || n > 200)) {
-          warnings.push('dims_out_of_range: dimensões fora de [0,5–200] cm; corrigido');
-        }
+      const n = toFloat(_22[i]); // valores já normalizados/clampados
+      if (n !== null && (n < 0.5 || n > 200)) {
+        warnings.push('dims_out_of_range: dimensões fora de [0,5–200] cm; corrigido');
       }
     }
 
@@ -221,7 +228,7 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       warnings.push('ncm_invalid_digits: NCM deve ter 8 dígitos; mantido vazio');
     }
 
-    // EAN inválido
+    // EAN inválido informado
     if ((parts[12] || '').replace(ONLY_DIGITS, '').length > 0 && _22[12] === '') {
       warnings.push('ean_invalid: EAN deve ter 13 dígitos; mantido vazio');
     }
@@ -257,7 +264,7 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       brand: _22[18] || undefined,
       volumes: _22[19] ? Number(_22[19]) : undefined,
       short_description: _22[20] || undefined,
-      images: _22[21] ? _22[21].split(',') : undefined,
+      images: _22[21] ? _22[21].split(',').map(s => s.trim()).filter(Boolean) : undefined,
       // não enviar: fornecedor, tags, parent_code
     });
 
@@ -313,7 +320,13 @@ export function buildSkeletonFromSeeds(seeds: string[]) {
 }
 
 export async function fetchEnrichment(items: Array<{ ean?: string; code?: string; name?: string; id?: string | number }>, mode: 'safe'|'fast') {
-  const out = [];
+  const out: Array<{
+    seed: { id: string | number | '', code: string, name: string, ean: string };
+    bn22_line: string;
+    confidence: Record<string, number>;
+    warnings: string[];
+  }> = [];
+
   for (const it of items) {
     const name = (it.name || '').trim();
     const code = (it.code || '').trim();
@@ -333,7 +346,7 @@ export async function fetchEnrichment(items: Array<{ ean?: string; code?: string
           if (Array.isArray(vol.categories) && vol.categories.length) { fill.tags = vol.categories.map((c: string) => c.toLowerCase()); confidence.tags = 0.8; }
           if (vol.title && !name) { fill.name = vol.title; confidence.name = 0.9; }
           // dimensões (quando presentes)
-          const dims = vol.dimensions || {};
+          const dims = (vol as any).dimensions || {};
           const toNum = (x: any) => typeof x === 'string' ? Number(x.toLowerCase().replace(',', '.').replace('cm','').trim()) : null;
           const w = toNum(dims.width), h = toNum(dims.height), d = toNum(dims.thickness || dims.depth);
           if (w) { fill.width_cm = clampDim(w); confidence.width_cm = 0.6; }

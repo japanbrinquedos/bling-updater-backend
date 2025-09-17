@@ -3,6 +3,19 @@ const BASE_URL = 'https://bling-updater-backend.onrender.com';
 
 const el = (id) => document.getElementById(id);
 
+// ---- parser de colagem: extrai blocos *...* mesmo com quebras de linha/HTML
+function extractStarBlocks(text) {
+  const s = String(text || '').replace(/\r/g, '');
+  // pega qualquer coisa entre * ... * (dotall)
+  const re = /\*[\s\S]*?\*/g;
+  const blocks = [];
+  let m;
+  while ((m = re.exec(s)) !== null) blocks.push(m[0]);
+  if (blocks.length) return blocks;
+  // fallback: se não houver *...*, usa linhas simples
+  return s.split('\n').map(x => x.trim()).filter(Boolean);
+}
+
 // ===== Auth status =====
 async function refreshAuth() {
   try {
@@ -31,7 +44,9 @@ el('btn-auth').onclick = () => {
 
 // ===== Colar & Enviar =====
 el('btn-preview-bn').onclick = async () => {
-  const lines = el('bn-input').value.split('\n').filter(Boolean);
+  const raw = el('bn-input').value;
+  const lines = extractStarBlocks(raw);
+  if (!lines.length) return alert('Cole pelo menos 1 linha.');
   const r = await fetch(`${BASE_URL}/bn/parse`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -48,26 +63,36 @@ el('btn-patch').onclick = async () => {
   const items = js.items || [];
   if (!items.length) return alert('Nada para enviar.');
 
-  const ids = [];
+  let okCount = 0, failCount = 0, skipCount = 0;
   for (const it of items) {
     const cols = (it.bnLine || '').split('|');
-    const id = cols[0] || null;
-    if (!id) continue;
+    // força ID numérico (remove qualquer não-dígito)
+    const idNum = Number(String(cols[0] || '').replace(/\D+/g, ''));
+    if (!Number.isFinite(idNum) || idNum <= 0) { skipCount++; continue; }
+
     const payload = it.patchPayload || {};
-    const res = await fetch(`${BASE_URL}/bling/patch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-      body: JSON.stringify({ id: Number(id), data: payload })
-    });
-    const jr = await res.json();
-    ids.push({ id, ok: jr.ok, result: jr.result });
+    try {
+      const res = await fetch(`${BASE_URL}/bling/patch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': (crypto?.randomUUID?.() || String(Math.random()))
+        },
+        body: JSON.stringify({ id: idNum, data: payload })
+      });
+      const jr = await res.json();
+      if (jr.ok) okCount++; else failCount++;
+    } catch {
+      failCount++;
+    }
   }
-  alert(`Atualização concluída.\n${ids.length} itens processados.`);
+  alert(`Atualização concluída.\nSucesso: ${okCount}\nFalhas: ${failCount}\nIgnorados (ID inválido): ${skipCount}`);
 };
 
 // ===== Buscar & Montar =====
 el('btn-build').onclick = async () => {
-  const seeds = el('seed-input').value.split('\n').filter(Boolean);
+  const seeds = extractStarBlocks(el('seed-input').value);
+  if (!seeds.length) return alert('Cole pelo menos 1 seed (*ID|Código|Descrição*).');
   const r = await fetch(`${BASE_URL}/search/build`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ seeds })
@@ -81,10 +106,10 @@ el('btn-fetch').onclick = async () => {
   if (!parsed) return alert('Faça a pré-visualização primeiro.');
   const js = JSON.parse(parsed);
   const items = (js.items || []).map(x => {
-    // tenta extrair EAN do nome (fallback leve)
-    const name = (x.seed || '').toLowerCase();
-    const m = name.match(/\b(\d{13})\b/);
-    return { name: x.seed, ean: m ? m[1] : undefined, code: undefined, id: undefined };
+    // heurística simples: tenta achar EAN de 13 dígitos no texto
+    const text = String(x.seed || '');
+    const m = text.match(/\b(\d{13})\b/);
+    return { name: text, ean: m ? m[1] : undefined, code: undefined, id: undefined };
   });
   const r = await fetch(`${BASE_URL}/search/fetch`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
