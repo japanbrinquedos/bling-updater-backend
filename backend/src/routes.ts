@@ -5,6 +5,7 @@ import {
   buildSkeletonFromSeeds,
   fetchEnrichment,
   PatchPolicy,
+  toBlingBody
 } from './services.js';
 import {
   getAccessToken,
@@ -14,7 +15,7 @@ import {
   authorizeHeaders,
   exchangeCodeForToken
 } from './tokenStore.js';
-import { blingPatch, blingListProducts } from './blingClient.js';
+import { putProduto, patchSituacaoProduto } from './blingClient.js';
 
 export const router = express.Router();
 
@@ -91,31 +92,36 @@ router.post('/search/fetch', async (req: Request, res: Response, next: NextFunct
 // ===== Bling =====
 router.post('/bling/patch', async (req: Request, res: Response, next: NextFunction) => {
   try {
+    // token
+    const token = getAccessToken();
+    if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
+
     // aceita id vindo sujo e força só dígitos
     const id = Number(String((req.body as any)?.id ?? '').replace(/\D+/g, ''));
     const data = (req.body as any)?.data || {};
     const dryRun: boolean = !!(req.body as any)?.dryRun;
-    const idempotencyKey = String((req.headers['idempotency-key'] as string) || (req.body as any)?.idempotencyKey || '');
 
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
 
     // aplica política de patch (filtra campos que não devem ser enviados)
     const filtered = PatchPolicy.filterOutgoing(data);
+    // mapeia p/ PT-BR do Bling
+    const body = toBlingBody(filtered);
 
     if (dryRun) {
-      return res.json({ ok: true, diff: { after: filtered } });
+      return res.json({ ok: true, bodyPreview: body, statusPreview: filtered.status });
     }
 
-    const result = await blingPatch(id, filtered, idempotencyKey);
-    res.json({ ok: true, result });
-  } catch (e) { next(e as Error); }
-});
+    let respProduto: any = null;
+    if (Object.keys(body).length) {
+      respProduto = await putProduto(id, body, token);
+    }
 
-router.post('/auto-fill-missing', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const page = Number((req.body as any)?.page || 1);
-    const limit = Number((req.body as any)?.limit || 50);
-    const result = await blingListProducts(page, limit);
-    res.json({ ok: true, result });
+    let respStatus: any = null;
+    if (filtered.status === 'A' || filtered.status === 'I') {
+      respStatus = await patchSituacaoProduto(id, filtered.status, token);
+    }
+
+    res.json({ ok: true, bling: { produto: respProduto, situacao: respStatus } });
   } catch (e) { next(e as Error); }
 });

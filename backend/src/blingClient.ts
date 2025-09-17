@@ -3,8 +3,6 @@ import axios from 'axios';
 const api = axios.create({
   baseURL: 'https://www.bling.com.br/Api/v3',
   headers: { Accept: 'application/json' },
-  // timeout opcional se quiser cortar requisições presas
-  // timeout: 15000,
 });
 
 function auth(token: string) {
