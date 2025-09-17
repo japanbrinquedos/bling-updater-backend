@@ -18,6 +18,15 @@ import { blingPatch, blingListProducts } from './blingClient.js';
 
 export const router = express.Router();
 
+// ---- helper: reconstrói blocos *...* mesmo com quebras de linha/HTML
+function extractStarBlocksFromJoined(s: string): string[] {
+  const text = String(s || '');
+  const m = text.match(/\*[\s\S]*?\*/g);
+  if (m && m.length) return m;
+  // fallback: sem *...*, usa linhas simples
+  return text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+}
+
 // ===== Auth =====
 router.get('/auth/status', (_req: Request, res: Response) => {
   res.json({ hasToken: !!getAccessToken(), expiresIn: getExpiresIn(), hasRefresh: true });
@@ -52,8 +61,10 @@ router.get('/auth/callback', async (req: Request, res: Response, next: NextFunct
 // ===== BN (Colar & Enviar) =====
 router.post('/bn/parse', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const lines: string[] = (req.body as any)?.lines?.map((s: any) => String(s ?? '')) || [];
-    const result = parseBNAndNormalize(lines);
+    const rawLines: string[] = ((req.body as any)?.lines || []).map((s: any) => String(s ?? ''));
+    // junta tudo e extrai blocos *...* (resiliente a HTML com \n)
+    const blocks = extractStarBlocksFromJoined(rawLines.join('\n'));
+    const result = parseBNAndNormalize(blocks);
     res.json(result);
   } catch (e) { next(e as Error); }
 });
@@ -61,7 +72,8 @@ router.post('/bn/parse', async (req: Request, res: Response, next: NextFunction)
 // ===== Buscar & Montar =====
 router.post('/search/build', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const seeds: string[] = (req.body as any)?.seeds?.map((s: any) => String(s ?? '')) || [];
+    const rawSeeds: string[] = ((req.body as any)?.seeds || []).map((s: any) => String(s ?? ''));
+    const seeds = extractStarBlocksFromJoined(rawSeeds.join('\n'));
     const items = buildSkeletonFromSeeds(seeds);
     res.json({ items });
   } catch (e) { next(e as Error); }
@@ -79,12 +91,13 @@ router.post('/search/fetch', async (req: Request, res: Response, next: NextFunct
 // ===== Bling =====
 router.post('/bling/patch', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const id = Number((req.body as any)?.id);
+    // aceita id vindo sujo e força só dígitos
+    const id = Number(String((req.body as any)?.id ?? '').replace(/\D+/g, ''));
     const data = (req.body as any)?.data || {};
     const dryRun: boolean = !!(req.body as any)?.dryRun;
     const idempotencyKey = String((req.headers['idempotency-key'] as string) || (req.body as any)?.idempotencyKey || '');
 
-    if (!id) return res.status(400).json({ ok: false, message: 'id obrigatório' });
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
 
     // aplica política de patch (filtra campos que não devem ser enviados)
     const filtered = PatchPolicy.filterOutgoing(data);

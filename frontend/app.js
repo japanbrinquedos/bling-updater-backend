@@ -6,13 +6,11 @@ const el = (id) => document.getElementById(id);
 // ---- parser de colagem: extrai blocos *...* mesmo com quebras de linha/HTML
 function extractStarBlocks(text) {
   const s = String(text || '').replace(/\r/g, '');
-  // pega qualquer coisa entre * ... * (dotall)
   const re = /\*[\s\S]*?\*/g;
   const blocks = [];
   let m;
   while ((m = re.exec(s)) !== null) blocks.push(m[0]);
   if (blocks.length) return blocks;
-  // fallback: se não houver *...*, usa linhas simples
   return s.split('\n').map(x => x.trim()).filter(Boolean);
 }
 
@@ -66,7 +64,6 @@ el('btn-patch').onclick = async () => {
   let okCount = 0, failCount = 0, skipCount = 0;
   for (const it of items) {
     const cols = (it.bnLine || '').split('|');
-    // força ID numérico (remove qualquer não-dígito)
     const idNum = Number(String(cols[0] || '').replace(/\D+/g, ''));
     if (!Number.isFinite(idNum) || idNum <= 0) { skipCount++; continue; }
 
@@ -106,7 +103,6 @@ el('btn-fetch').onclick = async () => {
   if (!parsed) return alert('Faça a pré-visualização primeiro.');
   const js = JSON.parse(parsed);
   const items = (js.items || []).map(x => {
-    // heurística simples: tenta achar EAN de 13 dígitos no texto
     const text = String(x.seed || '');
     const m = text.match(/\b(\d{13})\b/);
     return { name: text, ean: m ? m[1] : undefined, code: undefined, id: undefined };
