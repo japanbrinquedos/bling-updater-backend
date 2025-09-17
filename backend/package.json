@@ -1,6 +1,6 @@
 {
   "name": "bling-updater-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,10 @@
     "zod": "3.23.8"
   },
   "devDependencies": {
+    "@types/cors": "2.8.17",
+    "@types/express": "4.17.21",
+    "@types/node": "22.7.5",
+    "@types/qs": "6.9.15",
     "tsx": "4.16.2",
     "typescript": "5.6.2"
   }

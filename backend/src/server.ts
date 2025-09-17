@@ -1,15 +1,19 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { router } from './routes.js';
 
 const app = express();
 
 // CORS — em prod, whitelist do seu domínio estático
-const allowed = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const allowed = (process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // permitir ferramentas (curl, Postman)
+  origin: (origin: string | undefined, cb) => {
+    if (!origin) return cb(null, true); // permitir curl/Postman
     if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS bloqueado para ${origin}`));
   },
@@ -17,14 +21,14 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '2mb' }));
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req: Request, res: Response) => res.json({ ok: true }));
 
 // Rotas principais
 app.use(router);
 
 // Error handler simples e padronizado
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const errorId = Math.random().toString(36).slice(2, 9);
   const status = err.status || 500;
   const message = err.message || 'Erro interno';
