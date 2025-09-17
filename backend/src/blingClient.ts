@@ -1,39 +1,44 @@
-import axios from 'axios';
-import { authorizeHeaders, refreshWithRefreshToken, getAccessToken } from './tokenStore.js';
+import axios, { AxiosHeaders } from 'axios';
+import { refreshWithRefreshToken, getAccessToken } from './tokenStore.js';
 
 const api = axios.create({
   baseURL: process.env.BLING_API_BASE || 'https://www.bling.com.br/Api/v3',
   timeout: 10000
 });
 
-// Interceptor para token + refresh automático
+// Interceptor: injeta Bearer e tipa headers como AxiosHeaders
 api.interceptors.request.use(async (config) => {
   const token = getAccessToken();
-  config.headers = {
-    ...(config.headers || {}),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    Accept: 'application/json'
-  };
+  const headers = new AxiosHeaders(config.headers);
+  headers.set('Accept', 'application/json');
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  config.headers = headers;
   return config;
 });
 
+// 401 → tenta refresh e refaz uma única vez
 api.interceptors.response.use(undefined, async (error) => {
   const status = error?.response?.status;
   if (status === 401) {
-    await refreshWithRefreshToken().catch(() => {});
-    // retry uma vez
-    const token = getAccessToken();
-    if (token) {
-      error.config.headers.Authorization = `Bearer ${token}`;
-      return api.request(error.config);
+    try {
+      await refreshWithRefreshToken();
+      const token = getAccessToken();
+      if (token) {
+        const hdrs = new AxiosHeaders(error.config.headers);
+        hdrs.set('Authorization', `Bearer ${token}`);
+        error.config.headers = hdrs;
+        return api.request(error.config);
+      }
+    } catch {
+      // segue adiante para o throw
     }
   }
   throw error;
 });
 
 export async function blingPatch(productId: number, payload: Record<string, any>, idempotencyKey?: string) {
-  const headers: Record<string, string> = {};
-  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+  const headers = new AxiosHeaders();
+  if (idempotencyKey) headers.set('Idempotency-Key', idempotencyKey);
   const url = `/produtos/${productId}`;
   const r = await api.patch(url, payload, { headers });
   return r.data;
