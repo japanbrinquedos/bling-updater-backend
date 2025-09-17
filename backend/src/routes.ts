@@ -5,26 +5,29 @@ import {
   buildSkeletonFromSeeds,
   fetchEnrichment,
   PatchPolicy,
-  toBlingBody
+  toBlingBody,
 } from './services.js';
 import {
   getAccessToken,
   getExpiresIn,
   setTokens,
-  refreshWithRefreshToken,
-  authorizeHeaders,
-  exchangeCodeForToken
+  exchangeCodeForToken,
 } from './tokenStore.js';
-import { putProduto, patchSituacaoProduto } from './blingClient.js';
+import {
+  blingPutProduct,
+  blingPatchSituacao,
+  blingFindProductByCode,
+  blingGetProductById,
+  extractAxiosError,
+} from './blingClient.js';
 
 export const router = express.Router();
 
-// ---- helper: reconstrói blocos *...* mesmo com quebras de linha/HTML
+// -------- helper: extrai blocos *...* mesmo com HTML/quebras
 function extractStarBlocksFromJoined(s: string): string[] {
   const text = String(s || '');
   const m = text.match(/\*[\s\S]*?\*/g);
   if (m && m.length) return m;
-  // fallback: sem *...*, usa linhas simples
   return text.split(/\n+/).map(x => x.trim()).filter(Boolean);
 }
 
@@ -63,7 +66,6 @@ router.get('/auth/callback', async (req: Request, res: Response, next: NextFunct
 router.post('/bn/parse', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawLines: string[] = ((req.body as any)?.lines || []).map((s: any) => String(s ?? ''));
-    // junta tudo e extrai blocos *...* (resiliente a HTML com \n)
     const blocks = extractStarBlocksFromJoined(rawLines.join('\n'));
     const result = parseBNAndNormalize(blocks);
     res.json(result);
@@ -89,39 +91,70 @@ router.post('/search/fetch', async (req: Request, res: Response, next: NextFunct
   } catch (e) { next(e as Error); }
 });
 
-// ===== Bling =====
+// ===== Bling: PATCH (usa PUT mínimo + PATCH da situação) =====
+// >>> Mantém compatível com o FRONT atual: body = { id, data }
 router.post('/bling/patch', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // token
     const token = getAccessToken();
     if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
 
-    // aceita id vindo sujo e força só dígitos
+    // aceita id sujo e força dígitos
     const id = Number(String((req.body as any)?.id ?? '').replace(/\D+/g, ''));
     const data = (req.body as any)?.data || {};
-    const dryRun: boolean = !!(req.body as any)?.dryRun;
-
-    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
-
-    // aplica política de patch (filtra campos que não devem ser enviados)
-    const filtered = PatchPolicy.filterOutgoing(data);
-    // mapeia p/ PT-BR do Bling
-    const body = toBlingBody(filtered);
-
-    if (dryRun) {
-      return res.json({ ok: true, bodyPreview: body, statusPreview: filtered.status });
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
     }
 
+    // filtra campos não enviados e mapeia para PT-BR
+    const filtered = PatchPolicy.filterOutgoing(data);
+    const body = toBlingBody(filtered);
+
     let respProduto: any = null;
-    if (Object.keys(body).length) {
-      respProduto = await putProduto(id, body, token);
+    if (Object.keys(body).length > 0) {
+      try {
+        respProduto = await blingPutProduct(token, id, body);
+      } catch (e) {
+        const err = extractAxiosError(e);
+        return res.status(400).json({ ok: false, stage: 'putProduto', error: err });
+      }
     }
 
     let respStatus: any = null;
     if (filtered.status === 'A' || filtered.status === 'I') {
-      respStatus = await patchSituacaoProduto(id, filtered.status, token);
+      try {
+        respStatus = await blingPatchSituacao(token, id, filtered.status);
+      } catch (e) {
+        const err = extractAxiosError(e);
+        return res.status(400).json({ ok: false, stage: 'patchSituacao', error: err });
+      }
     }
 
     res.json({ ok: true, bling: { produto: respProduto, situacao: respStatus } });
+  } catch (e) { next(e as Error); }
+});
+
+// ===== Debug: consultar produto por código ou id =====
+router.get('/debug/product', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const token = getAccessToken();
+    if (!token) return res.status(401).json({ ok: false, message: 'auth ausente' });
+
+    const code = (req.query.code as string) || '';
+    const idQ = (req.query.id as string) || '';
+
+    if (code) {
+      const found = await blingFindProductByCode(token, code);
+      if (!found?.id) return res.status(404).json({ ok: false, message: 'Produto não encontrado por código' });
+      const full = await blingGetProductById(token, found.id);
+      return res.json({ ok: true, summary: found, full });
+    }
+
+    if (idQ) {
+      const full = await blingGetProductById(token, idQ);
+      if (!full) return res.status(404).json({ ok: false, message: 'Produto não encontrado por id' });
+      return res.json({ ok: true, full });
+    }
+
+    return res.status(400).json({ ok: false, message: 'Informe ?code= ou ?id=' });
   } catch (e) { next(e as Error); }
 });
