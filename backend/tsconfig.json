@@ -7,9 +7,10 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "outDir": "backend/dist",
-    "rootDir": "backend/src",
+    "rootDir": "src",
+    "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["backend/src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist"]
 }

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p backend/tsconfig.json",
     "start": "node backend/dist/server.js"
   },
   "dependencies": {
