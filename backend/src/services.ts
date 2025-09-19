@@ -1,4 +1,5 @@
-// Utilidades de parsing/normalização BN22 e mapeamento p/ Bling (PT-BR)
+// Utilidades de parsing/normalização BN22, mapeamento p/ Bling (PT-BR)
+// e stubs de Buscar & Montar (buildSkeletonFromSeeds / fetchEnrichment)
 
 export type BNRow = [
   string, string, string, string, string, string, string, string, string, string, string,
@@ -20,8 +21,10 @@ export interface BNParseResponse {
 }
 
 export const PatchPolicy = {
-  // Campos não enviados ao PUT do produto
-  BLOCKLIST: new Set<string>(['supplier','tags','parent_code','fornecedor','grupo_tags','codigo_pai','images','status']),
+  // Campos NÃO enviados ao PUT do produto
+  BLOCKLIST: new Set<string>([
+    'supplier','tags','parent_code','fornecedor','grupo_tags','codigo_pai','images','status'
+  ]),
   filterOutgoing(data: Record<string, any>): Record<string, any> {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(data || {})) {
@@ -33,14 +36,17 @@ export const PatchPolicy = {
   }
 };
 
-// Helpers
+// ----------------- Helpers comuns -----------------
 const ONLY_DIGITS = /[^0-9]/g;
 const HTML_TAG = /<[^>]+>/g;
 
 function stripWrappers(s: string): string {
   let t = String(s ?? '').trim();
+  // remove aspas externas
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) t = t.slice(1, -1).trim();
+  // remove asteriscos externos *...*
   if (t.startsWith('*') && t.endsWith('*')) t = t.slice(1, -1).trim();
+  // remove combinações *" ... "* / *' ... '*
   if ((t.startsWith('*"') && t.endsWith('"*')) || (t.startsWith("*'") && t.endsWith("'*"))) t = t.slice(2, -2).trim();
   return t;
 }
@@ -49,7 +55,7 @@ function sanitizeDelimiters(s: string): string {
 }
 function parsePTBRNumber(x: string | number | null | undefined): number | null {
   if (x === null || x === undefined) return null;
-  if (typeof x === 'number') return x;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
   const s = String(x).trim();
   if (!s) return null;
   const norm = s.replace(/\./g, '').replace(',', '.');
@@ -89,6 +95,7 @@ function isHttpUrl(u: string): boolean {
   try { const x = new URL(u); return x.protocol === 'http:' || x.protocol === 'https:'; } catch { return false; }
 }
 
+// ----------------- Parser BN 22 colunas -----------------
 export function parseBNAndNormalize(lines: string[]): BNParseResponse {
   const cleaned_lines: string[] = [];
   const errors: string[] = [];
@@ -106,7 +113,7 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       while (parts.length < 22) parts.push('');
     }
 
-    // Imagens após col 22 separadas por | ou , — consolidar no col 22
+    // Imagens extras após col 22 -> consolidar na 22
     let extraImgs: string[] = [];
     if (parts.length > 22) {
       extraImgs = parts.slice(21);
@@ -128,10 +135,10 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       (parts[1] || ''),   // 2 Código
       (parts[2] || ''),   // 3 Descrição
       (parts[3] || 'UN'), // 4 Unidade
-      normalizeNCM(parts[4] || ''), // 5 NCM (8 dígitos)
+      normalizeNCM(parts[4] || ''), // 5 NCM
       (() => { const n = parsePTBRNumber(parts[5] || ''); return n !== null ? n.toFixed(2).replace('.', ',') : ''; })(), // 6 Preço
-      (parts[6] || 'Ativo'), // 7 Situação (texto)
-      (() => { const n = parsePTBRNumber(parts[7] || ''); return n !== null ? n.toFixed(2).replace('.', ',') : ''; })(), // 8 Preço de custo
+      (parts[6] || 'Ativo'), // 7 Situação texto
+      (() => { const n = parsePTBRNumber(parts[7] || ''); return n !== null ? n.toFixed(2).replace('.', ',') : ''; })(), // 8 Preço custo
       (parts[8] || ''),   // 9 Cód fornecedor
       (parts[9] || '').toUpperCase(), // 10 Fornecedor (não patch)
       (() => { const n = ceil1(parsePTBRNumber(parts[10] || '')); return n !== null ? n.toFixed(1).replace('.', ',') : ''; })(), // 11 Peso liq
@@ -156,7 +163,7 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
       return Number.isFinite(n) ? n : null;
     };
 
-    // Swap de pesos se necessário
+    // Swap de pesos se bruto < líquido
     const pesoLiq = toFloat(_22[10]);
     const pesoBru = toFloat(_22[11]);
     if (pesoLiq !== null && pesoBru !== null && pesoBru < pesoLiq) {
@@ -210,7 +217,7 @@ export function parseBNAndNormalize(lines: string[]): BNParseResponse {
   return { cleaned_lines, errors, items };
 }
 
-// Mapeia payload interno (EN) -> Bling (PT-BR)
+// ----------------- EN (interno) -> Bling (PT-BR) -----------------
 export function toBlingBody(n: Record<string, any>) {
   const body: Record<string, any> = {};
 
@@ -240,4 +247,52 @@ export function toBlingBody(n: Record<string, any>) {
   if (n.short_description) body.descricaoCurta = String(n.short_description).replace(/<[^>]+>/g, ' ').slice(0, 255).trim();
 
   return body;
+}
+
+// ----------------- Buscar & Montar: stubs seguros -----------------
+
+/**
+ * Constrói “esqueletos” a partir de seeds no formato:
+ * "*ID|Código|Descrição*" OU "*Código|Descrição*" OU apenas "*Código*"
+ * Retorna objetos com { id?, code?, name? } prontos para enrichment.
+ */
+export function buildSkeletonFromSeeds(seeds: string[]) {
+  const out: Array<{ seed: string; id?: string; code?: string; name?: string }> = [];
+
+  for (const raw of seeds || []) {
+    const s = sanitizeDelimiters(stripWrappers(raw));
+    const parts = s.split('|').map(x => x.trim()).filter(Boolean);
+
+    let id: string | undefined;
+    let code: string | undefined;
+    let name: string | undefined;
+
+    if (parts.length >= 3) { // ID|Código|Descrição
+      id = parts[0];
+      code = parts[1];
+      name = parts.slice(2).join(' ');
+    } else if (parts.length === 2) { // Código|Descrição
+      code = parts[0];
+      name = parts[1];
+    } else if (parts.length === 1) {
+      // pode ser só o código
+      code = parts[0];
+    }
+
+    out.push({ seed: raw, id, code, name });
+  }
+
+  return out;
+}
+
+/**
+ * Enriquecimento “fast/safe” (stub): por ora só retorna os itens
+ * (sem chamadas externas). Ponto de extensão futuro para web scraping/API.
+ */
+export async function fetchEnrichment(
+  items: Array<{ ean?: string; code?: string; name?: string; id?: string | number }>,
+  _mode: 'safe' | 'fast' = 'safe'
+) {
+  // No-op: devolve o que recebeu (mantém contrato da rota /search/fetch)
+  return items || [];
 }
