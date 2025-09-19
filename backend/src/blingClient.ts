@@ -1,6 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import axios from "axios";
-
 const API = "https://www.bling.com.br/Api/v3";
 
 function headers(token: string, extra?: Record<string, string>) {
@@ -23,7 +21,6 @@ export async function patchProdutoById(token: string, id: string | number, body:
   return json;
 }
 
-/** Imagens replace — caminho 1 (endpoint dedicado) */
 export async function putImagensReplace(token: string, id: string | number, urls: string[], idem?: string) {
   const r = await fetch(`${API}/produtos/${encodeURIComponent(id)}/imagens`, {
     method: "PUT",
@@ -35,7 +32,6 @@ export async function putImagensReplace(token: string, id: string | number, urls
   return json;
 }
 
-/** Fallback — mandar imagens no próprio produto (se o tenant aceitar) */
 export async function patchProdutoImagensFallback(token: string, id: string | number, urls: string[], idem?: string) {
   const r = await fetch(`${API}/produtos/${encodeURIComponent(id)}`, {
     method: "PATCH",
