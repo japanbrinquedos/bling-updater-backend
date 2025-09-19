@@ -104,50 +104,104 @@ router.post('/bling/patch', async (req: Request, res: Response) => {
     return res.status(400).json({ ok: false, message: 'id obrigatório (numérico)' });
   }
 
-  // Filtra e converte p/ PT-BR
-  const filtered = PatchPolicy.filterOutgoing(data);
-  const fullBody = toBlingBody(filtered);
+  // 1) BN -> PT-BR (apenas campos que o front trouxe)
+  const incoming = toBlingBody(PatchPolicy.filterOutgoing(data));
 
-  // Bling v3 exige 'tipo' e 'formato' até para update parcial → buscar do produto atual
-  let tipo = 'P';
-  let formato = 'S';
+  // 2) GET produto atual para preservar o que não foi enviado
+  let current: any = null;
   try {
-    const current = await blingGetProductById(token, id);
-    if (current?.tipo)    tipo = String(current.tipo);
-    if (current?.formato) formato = String(current.formato);
+    current = await blingGetProductById(token, id);
   } catch {
-    // segue com fallback 'P' e 'S'
+    // se falhar, current fica null (usaremos defaults pontuais)
   }
 
-  // Modo mínimo + requisitos: codigo/nome/preco + tipo/formato
-  const body: any = { tipo, formato };
-  if (fullBody.codigo) body.codigo = fullBody.codigo;
-  if (fullBody.nome)   body.nome   = fullBody.nome;
-  if (typeof fullBody.preco === 'number') body.preco = Number(fullBody.preco.toFixed(2));
+  // 3) tipo/formato obrigatórios
+  const tipo = current?.tipo ? String(current.tipo) : 'P';
+  const formato = current?.formato ? String(current.formato) : 'S';
 
-  // PUT produto
-  let respProduto: any = null;
-  if (Object.keys(body).length > 0) {
-    try {
-      respProduto = await blingPutProduct(token, id, body);
-    } catch (e) {
-      const err = extractAxiosError(e);
-      return res.status(400).json({ ok: false, stage: 'putProduto', error: err, sentBody: body });
+  // 4) Merge seguro: usa BN se veio; senão mantém o valor atual do Bling
+  const pick = (key: string) => (incoming[key] !== undefined ? incoming[key] : current?.[key]);
+
+  const normalizeNum = (v: any) => {
+    if (v === undefined || v === null || v === '') return undefined;
+    if (typeof v === 'string') {
+      const n = Number(v.replace(',', '.'));
+      return Number.isFinite(n) ? n : undefined;
     }
+    return Number(v);
+  };
+
+  const body: any = { tipo, formato };
+
+  // Identificação e preço
+  if (pick('codigo')) body.codigo = pick('codigo');
+  if (pick('nome'))   body.nome   = pick('nome');
+  const preco = normalizeNum(pick('preco'));
+  if (preco !== undefined) body.preco = preco;
+
+  // Campos críticos que não podem ser perdidos
+  const unidade = pick('unidade');
+  if (unidade) body.unidade = unidade;
+
+  const ncmDigits = String(pick('ncm') || '').replace(/[^0-9]/g, '');
+  if (ncmDigits) body.ncm = ncmDigits;
+
+  const gtin = pick('gtin');
+  if (gtin) body.gtin = String(gtin);
+
+  const pesoLiq = normalizeNum(pick('pesoLiq'));
+  if (pesoLiq !== undefined) body.pesoLiq = pesoLiq;
+
+  const pesoBruto = normalizeNum(pick('pesoBruto'));
+  if (pesoBruto !== undefined) body.pesoBruto = pesoBruto;
+
+  const largura = normalizeNum(pick('largura'));
+  if (largura !== undefined) body.largura = largura;
+
+  const altura = normalizeNum(pick('altura'));
+  if (altura !== undefined) body.altura = altura;
+
+  const profundidade = normalizeNum(pick('profundidade'));
+  if (profundidade !== undefined) body.profundidade = profundidade;
+
+  const volumes = normalizeNum(pick('volumes'));
+  if (volumes !== undefined) body.volumes = volumes;
+
+  const precoCusto = normalizeNum(pick('precoCusto'));
+  if (precoCusto !== undefined) body.precoCusto = precoCusto;
+
+  if (pick('marca')) {
+    body.marca = String(pick('marca')).toUpperCase();
   }
 
-  // PATCH situação (A/I) se vier no front
-  let respStatus: any = null;
-  if (filtered.status === 'A' || filtered.status === 'I') {
+  const descricaoCurtaRaw = pick('descricaoCurta');
+  if (descricaoCurtaRaw) {
+    body.descricaoCurta = String(descricaoCurtaRaw).replace(/<[^>]+>/g, ' ').slice(0, 255).trim();
+  } else if (current?.descricaoCurta) {
+    body.descricaoCurta = String(current.descricaoCurta).slice(0, 255).trim();
+  }
+
+  // 5) PUT produto
+  let respProduto: any = null;
+  try {
+    respProduto = await blingPutProduct(token, id, body);
+  } catch (e) {
+    const err = extractAxiosError(e);
+    return res.status(400).json({ ok: false, stage: 'putProduto', error: err, sentBody: body });
+  }
+
+  // 6) PATCH situação (A/I) se veio status no front
+  const statusFront = (data?.status || data?.Status || '').toString().toUpperCase();
+  if (statusFront === 'A' || statusFront === 'I') {
     try {
-      respStatus = await blingPatchSituacao(token, id, filtered.status);
+      await blingPatchSituacao(token, id, statusFront as 'A' | 'I');
     } catch (e) {
       const err = extractAxiosError(e);
       return res.status(400).json({ ok: false, stage: 'patchSituacao', error: err });
     }
   }
 
-  return res.json({ ok: true, bling: { produto: respProduto, situacao: respStatus } });
+  return res.json({ ok: true, bling: { produto: respProduto } });
 });
 
 /* ================ DEBUG: Produto via API Bling ================ */

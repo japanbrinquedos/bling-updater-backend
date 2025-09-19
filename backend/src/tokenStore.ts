@@ -1,56 +1,80 @@
 import axios from 'axios';
-import qs from 'qs';
 
-let ACCESS_TOKEN = '';
-let REFRESH_TOKEN = '';
-let EXPIRES_AT = 0; // epoch seconds
+type Tokens = {
+  access_token: string;
+  refresh_token?: string;
+  token_type?: string;
+  expires_in: number; // segundos
+  created_at: number; // epoch ms (nosso)
+};
 
-export function setTokens(tokens: { access_token: string; refresh_token?: string; expires_in?: number }) {
-  ACCESS_TOKEN = tokens.access_token || '';
-  if (tokens.refresh_token) REFRESH_TOKEN = tokens.refresh_token;
-  if (tokens.expires_in) EXPIRES_AT = Math.floor(Date.now() / 1000) + tokens.expires_in;
+let TOKENS: Tokens | null = null;
+
+export function setTokens(t: { access_token: string; refresh_token?: string; expires_in: number; token_type?: string }) {
+  TOKENS = {
+    access_token: t.access_token,
+    refresh_token: t.refresh_token,
+    token_type: t.token_type || 'Bearer',
+    expires_in: t.expires_in,
+    created_at: Date.now()
+  };
 }
 
-export function getAccessToken() { return ACCESS_TOKEN; }
-export function getExpiresIn(): number | null {
-  if (!EXPIRES_AT) return null;
-  return Math.max(0, EXPIRES_AT - Math.floor(Date.now() / 1000));
+export function getAccessToken(): string | null {
+  if (!TOKENS) return null;
+  const left = getExpiresIn();
+  if (left <= 0) return null;
+  return TOKENS.access_token;
+}
+
+export function getExpiresIn(): number {
+  if (!TOKENS) return 0;
+  const elapsed = (Date.now() - TOKENS.created_at) / 1000;
+  return Math.max(0, Math.floor(TOKENS.expires_in - elapsed));
+}
+
+function basicAuthHeader(): string {
+  const id = process.env.BLING_CLIENT_ID || '';
+  const sec = process.env.BLING_CLIENT_SECRET || '';
+  const raw = Buffer.from(`${id}:${sec}`).toString('base64');
+  return `Basic ${raw}`;
 }
 
 export async function exchangeCodeForToken(code: string) {
-  const tokenURL = 'https://www.bling.com.br/Api/v3/oauth/token';
-  const clientId = process.env.BLING_CLIENT_ID!;
-  const clientSecret = process.env.BLING_CLIENT_SECRET!;
   const redirect = process.env.BLING_REDIRECT_URL!;
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const url = 'https://www.bling.com.br/Api/v3/oauth/token';
+  const data = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirect
+  });
 
-  const r = await axios.post(tokenURL,
-    qs.stringify({ grant_type: 'authorization_code', code, redirect_uri: redirect }),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Basic ${basic}` }, timeout: 15000 }
-  );
-  return r.data; // { access_token, refresh_token, expires_in, ... }
+  const res = await axios.post(url, data, {
+    headers: {
+      Authorization: basicAuthHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    timeout: 20000
+  });
+  return res.data as { access_token: string; refresh_token?: string; expires_in: number; token_type?: string };
 }
 
-export async function refreshWithRefreshToken() {
-  if (!REFRESH_TOKEN) throw new Error('no refresh_token available');
-  const tokenURL = 'https://www.bling.com.br/Api/v3/oauth/token';
-  const clientId = process.env.BLING_CLIENT_ID!;
-  const clientSecret = process.env.BLING_CLIENT_SECRET!;
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+export async function refreshAccessToken() {
+  if (!TOKENS?.refresh_token) throw new Error('refresh token ausente');
+  const url = 'https://www.bling.com.br/Api/v3/oauth/token';
+  const data = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: TOKENS.refresh_token!
+  });
 
-  const r = await axios.post(tokenURL,
-    qs.stringify({ grant_type: 'refresh_token', refresh_token: REFRESH_TOKEN }),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Basic ${basic}` }, timeout: 15000 }
-  );
-  setTokens(r.data);
-  return r.data;
+  const res = await axios.post(url, data, {
+    headers: {
+      Authorization: basicAuthHeader(),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    timeout: 20000
+  });
+  const t = res.data as { access_token: string; refresh_token?: string; expires_in: number; token_type?: string };
+  setTokens(t);
+  return t;
 }
-
-// header helper (não usado diretamente aqui, mas disponível)
-export function authorizeHeaders() {
-  const tok = getAccessToken();
-  return tok ? { Authorization: `Bearer ${tok}` } : {};
-}
-
-// refresh “preguiçoso”: checa a cada chamada via interceptors; opcionalmente você pode
-// colocar um setInterval aqui para renovar faltando N segundos.
