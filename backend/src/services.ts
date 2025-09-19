@@ -1,178 +1,112 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { sanitizeHtmlToText } from "./utils.js";
+import { stripOuterQuotesAndAsterisks, normalizeSpacesAndTabs, stripHtmlToText, onlyDigits, toFloatPtBR, toNumber, mapSituacao } from "./utils.js";
 
 /**
- * BN 22 colunas (com imagens extras após a 22ª, separadas por |).
- * Atualizamos TUDO que vier preenchido (exceto fornecedor/tags), via PATCH parcial.
- * Imagens: quando presentes, enviamos no payload (Replace).
+ * Parser da linha BN (22 colunas) com tolerância:
+ * - Remove aspas envolventes e * do início/fim
+ * - Une quebras de linha do conteúdo colado
+ * - Converte NCM para 8 dígitos (somente números)
+ * - Junta múltiplas URLs de imagem no final (separadas por "|" no Excel) em array
+ * - Remove HTML da descrição curta
+ * - NÃO envia Fornecedor/Tags no PATCH
+ *
+ * Mapeamento (1-based):
+ *  1 ID, 2 Código, 3 Nome, 4 Unidade, 5 NCM, 7 Preço, 10 Situação,
+ * 12 Preço de custo, 13 Cód fornecedor, 18 Peso líquido, 19 Peso bruto,
+ * 20 GTIN/EAN, 22 Largura, 23 Altura, 24 Profundidade, 39 Marca,
+ * 41 Volumes, 42 Descrição curta, 44+ Imagens (urls extras)
  */
+export function parseBNAndNormalize(bnText: string) {
+  const raw = bnText.replace(/\r\n/g, "\n").trim();
 
-export type ParsedItem = {
-  input: string;
-  cleaned: string;
-  warnings: string[];
-  bnLine: string;
-  patchPayload: Record<string, any>; // payload interno (EN) a ser enviado ao PATCH
-};
+  // consolida tudo numa linha (o usuário às vezes cola HTML com quebras)
+  let line = raw;
+  // tira aspas e asteriscos externos
+  line = stripOuterQuotesAndAsterisks(line);
+  // remove tabs e normaliza espaços
+  line = normalizeSpacesAndTabs(line);
 
-export type ParsedResult = {
-  cleaned_lines: string[];
-  errors: string[];
-  items: ParsedItem[];
-};
+  // substitui "|    |" e "| \t|" edge-cases -> "| |" já cobertos pelo normalize
+  // split primário por "|"
+  let parts = line.split("|").map((p) => p.trim());
 
-/** Helpers */
-function unbox(line: string): string {
-  let s = line.trim();
-  // tira aspas envoltórias
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
-  // tira asteriscos guardas da sua fórmula
-  if (s.startsWith("*")) s = s.slice(1);
-  if (s.endsWith("*")) s = s.slice(0, -1);
-  // tabs viram pipes
-  s = s.replace(/\t+/g, "|");
-  // normaliza " | " -> "|"
-  s = s.replace(/\s*\|\s*/g, "|").trim();
-  return s;
-}
-function toNumberBR(v?: string): number | undefined {
-  if (!v) return undefined;
-  const s = v.replace(/\./g, "").replace(",", ".");
-  const n = Number(s);
-  return Number.isFinite(n) ? n : undefined;
-}
-function onlyDigitsNCM(v?: string): string | undefined {
-  if (!v) return undefined;
-  const d = v.replace(/\D/g, "");
-  return d.length === 8 ? d : d || undefined;
-}
-function isHttp(u: string): boolean {
-  try { const x = new URL(u); return x.protocol === "http:" || x.protocol === "https:"; } catch { return false; }
-}
-function statusToAI(s?: string): "A" | "I" | undefined {
-  if (!s) return undefined;
-  const t = s.trim().toLowerCase();
-  if (t.startsWith("ativo")) return "A";
-  if (t.startsWith("inativo")) return "I";
-  return undefined;
-}
+  // Se o usuário traz pipes dentro de HTML, já removemos HTML ao extrair col 42
+  const get = (idx1: number) => (parts[idx1 - 1] ?? "").trim();
 
-/** Quebra a BN em 22 colunas + imagens extras (| ou ,) */
-function splitBN(s: string): { cols: string[]; images: string[] } {
-  const parts = s.split("|");
-  const cols = parts.slice(0, 22).map((c) => c?.trim() ?? "");
-  const rest = parts.slice(22);
-  const csvImgs = rest.join("|").trim();
-  const images = csvImgs
-    ? csvImgs.split(/[|,]/).map(x => x.trim()).filter(Boolean).filter(isHttp)
-    : [];
-  return { cols, images };
-}
-
-/** Monta linha BN “limpa” p/ preview (imagens no final, separadas por vírgula) */
-function toCleanBNLine(cols: string[], images: string[]): string {
-  return `${cols.join("|")}${images.length ? "|" + images.join(",") : ""}`;
-}
-
-/** Parser principal: retorna payload parcial (EN) + linha BN normalizada */
-export function parseBNAndNormalize(bn: string): ParsedResult {
-  const lines = bn.replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
-
-  const cleaned_lines: string[] = [];
-  const errors: string[] = [];
-  const items: ParsedItem[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const normalized = unbox(raw);
-    const { cols, images } = splitBN(normalized);
-
-    if (cols.length < 22) {
-      errors.push(`Linha ${i + 1}: ${cols.length} colunas (<22)`);
-      while (cols.length < 22) cols.push("");
-    }
-
-    // Colunas (1..22) -> indices 0..21
-    const [
-      id,            // 1
-      code,          // 2
-      name,          // 3
-      unit,          // 4
-      ncm,           // 5
-      price,         // 6
-      statusText,    // 7
-      costPrice,     // 8
-      supplierCode,  // 9
-      _supplier,     // 10 (NÃO ENVIAR)
-      netWeight,     // 11
-      grossWeight,   // 12
-      ean,           // 13
-      width,         // 14
-      height,        // 15
-      depth,         // 16
-      _tags,         // 17 (NÃO ENVIAR)
-      _parent,       // 18 (N/A por enquanto)
-      brand,         // 19
-      volumes,       // 20
-      shortDesc,     // 21
-      _imagesCol     // 22 (já tratamos como “images” acima)
-    ] = cols;
-
-    // Normalizações leves para o preview
-    if (cols[20]) cols[20] = sanitizeHtmlToText(cols[20]);
-    if (cols[4])  cols[4]  = onlyDigitsNCM(cols[4]) ?? "";
-
-    const toDec = (v?: string) => (v ? String(toNumberBR(v) ?? "").replace(".", ",") : "");
-    [5, 7, 10, 11, 13, 14, 15].forEach(idx => { if (cols[idx]) cols[idx] = toDec(cols[idx]); });
-
-    const cleaned = toCleanBNLine(cols, images);
-    cleaned_lines.push(cleaned);
-
-    // Payload parcial (EN) — SÓ campos presentes
-    const payload: Record<string, any> = {};
-    if (id?.trim())            payload.id = id.trim();
-    if (code?.trim())          payload.code = code.trim();
-    if (name?.trim())          payload.name = name.trim();
-    if (unit?.trim())          payload.unit = unit.trim();
-    const ncmDigits = onlyDigitsNCM(ncm);
-    if (ncmDigits)             payload.ncm = ncmDigits;
-    const p = toNumberBR(price);
-    if (p !== undefined)       payload.price = p;
-    const st = statusToAI(statusText);
-    if (st)                    payload.status = st;
-    const cp = toNumberBR(costPrice);
-    if (cp !== undefined)      payload.cost_price = cp;
-    if (supplierCode?.trim())  payload.supplier_code = supplierCode.trim();
-    const nw = toNumberBR(netWeight);
-    if (nw !== undefined)      payload.net_weight = nw;
-    const gw = toNumberBR(grossWeight);
-    if (gw !== undefined)      payload.gross_weight = gw;
-    if (ean?.trim())           payload.ean = ean.trim();
-    const w = toNumberBR(width);
-    if (w !== undefined)       payload.width_cm = w;
-    const h = toNumberBR(height);
-    if (h !== undefined)       payload.height_cm = h;
-    const d = toNumberBR(depth);
-    if (d !== undefined)       payload.depth_cm = d;
-    if (brand?.trim())         payload.brand = brand.trim().toUpperCase();
-    const vol = toNumberBR(volumes);
-    if (vol !== undefined)     payload.volumes = vol;
-    if (shortDesc?.trim())     payload.short_description = sanitizeHtmlToText(shortDesc).slice(0, 2000);
-
-    // Imagens: se vieram, enviamos — Replace (o backend vai mandar a lista final)
-    if (images.length)         payload.images = images;
-
-    // Nunca enviamos fornecedor (nome) nem tags
-    // (já não entram no payload)
-
-    items.push({
-      input: raw,
-      cleaned,
-      warnings: [],
-      bnLine: cleaned,
-      patchPayload: payload,
-    });
+  // imagens: podem vir nas colunas 44 em diante OU tudo na mesma coluna separado por vírgula
+  let imagesRaw: string[] = [];
+  if (parts.length >= 44) {
+    imagesRaw = parts.slice(44 - 1).flatMap((p) =>
+      p.split(",").map((u) => u.trim()).filter(Boolean)
+    );
+    // reduz vetor original para 43 posições para não confundir contagem
+    parts = parts.slice(0, 43);
   }
 
-  return { cleaned_lines, errors, items };
+  // campos
+  const idStr = get(1);
+  const id = onlyDigits(idStr) || idStr; // mantém string caso ID não seja só dígitos
+  const code = get(2) || undefined;
+  const name = get(3) || undefined;
+  const unit = get(4) || undefined;
+  const ncm = onlyDigits(get(5)) || undefined; // "94049000"
+  const price = toFloatPtBR(get(7));
+  const situacao = mapSituacao(get(10)); // "A"/"I"
+  const costPrice = toFloatPtBR(get(12));
+  const supplierCode = get(13) || undefined; // NÃO será enviado
+  const netWeight = toFloatPtBR(get(18));
+  const grossWeight = toFloatPtBR(get(19));
+  const ean = onlyDigits(get(20)) || undefined;
+  const width = toFloatPtBR(get(22));
+  const height = toFloatPtBR(get(23));
+  const depth = toFloatPtBR(get(24));
+  const brand = (get(39) || "").toUpperCase() || undefined;
+  const volumes = toNumber(get(41));
+  const shortDesc = stripHtmlToText(get(42) || "");
+
+  // normaliza imagens (http/https apenas)
+  const images = imagesRaw
+    .map((u) => u.replace(/^\s+|\s+$/g, ""))
+    .filter((u) => /^https?:\/\//i.test(u));
+
+  // monta payload de PATCH (somente presentes)
+  const patch: Record<string, any> = {};
+  if (code) patch.codigo = code;
+  if (name) patch.nome = name;
+  if (unit) patch.unidade = unit;
+  if (ncm) patch.ncm = ncm;
+  if (typeof price === "number") patch.preco = price;
+  if (situacao) patch.situacao = situacao;
+  if (typeof costPrice === "number") patch.precoCusto = costPrice;
+  // fornecedor/tag não enviamos no PATCH
+  if (typeof netWeight === "number") patch.pesoLiquido = netWeight;
+  if (typeof grossWeight === "number") patch.pesoBruto = grossWeight;
+  if (ean) patch.gtin = ean;
+  if (typeof width === "number") patch.larguraProduto = width;
+  if (typeof height === "number") patch.alturaProduto = height;
+  if (typeof depth === "number") patch.profundidadeProduto = depth;
+  if (brand) patch.marca = brand;
+  if (typeof volumes === "number") patch.volumes = volumes;
+  if (shortDesc) patch.descricaoCurta = shortDesc;
+
+  // imagens ficam para uma 2ª chamada dedicada, mas retornamos aqui para a rota decidir
+  const resultItem = {
+    id,
+    bnLine: parts.join("|"),
+    patchPayload: patch,
+    images,
+  };
+
+  return {
+    cleaned_lines: [resultItem.bnLine + (images.length ? "|" + images.join(",") : "")],
+    errors: [], // validações críticas podem ser adicionadas aqui
+    items: [resultItem],
+  };
+}
+
+/**
+ * Constrói corpo final do PATCH (já vem "seletivo")
+ * (mantido por semântica/legibilidade na rota)
+ */
+export function toBlingPatchBody(patch: Record<string, any>) {
+  return patch;
 }
