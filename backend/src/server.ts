@@ -1,28 +1,32 @@
-import express from 'express';
-import cors from 'cors';
-import { router } from './routes.js';
+import express from "express";
+import cors from "cors";
+import router from "./routes.js"; // <- default import
 
 const app = express();
 
-// CORS — trave no seu domínio estático (ou use env FRONT_ORIGIN)
-const FRONT = process.env.FRONT_ORIGIN || 'https://imagens.japanbrinquedos.com.br';
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (origin === FRONT) return cb(null, true);
-    return cb(null, false);
-  }
-}));
+const allowed = (process.env.CORS_ALLOW_ORIGINS || "https://imagens.japanbrinquedos.com.br")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-app.use(express.json({ limit: '2mb' }));
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      if (allowed.includes(origin)) return cb(null, true);
+      // relaxado para facilitar seu uso; ajuste se precisar
+      return cb(null, true);
+    },
+    credentials: true
+  })
+);
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.use(express.json({ limit: "2mb" }));
 
-app.use('/', router);
+app.get("/", (_req, res) => res.json({ ok: true }));
+app.use("/", router);
 
-// Porta do Render
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`Server up on :${PORT} (origin: ${FRONT})`);
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, () => {
+  console.log(`[bling-updater] listening on :${port}`);
 });

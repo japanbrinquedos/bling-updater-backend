@@ -1,58 +1,45 @@
-import { stripOuterQuotesAndAsterisks, normalizeSpacesAndTabs, stripHtmlToText, onlyDigits, toFloatPtBR, toNumber, mapSituacao } from "./utils.js";
+import {
+  stripOuterQuotesAndAsterisks,
+  normalizeSpacesAndTabs,
+  stripHtmlToText,
+  onlyDigits,
+  toFloatPtBR,
+  toNumber,
+  mapSituacao
+} from "./utils.js";
 
 /**
- * Parser da linha BN (22 colunas) com tolerância:
- * - Remove aspas envolventes e * do início/fim
- * - Une quebras de linha do conteúdo colado
- * - Converte NCM para 8 dígitos (somente números)
- * - Junta múltiplas URLs de imagem no final (separadas por "|" no Excel) em array
- * - Remove HTML da descrição curta
- * - NÃO envia Fornecedor/Tags no PATCH
- *
- * Mapeamento (1-based):
- *  1 ID, 2 Código, 3 Nome, 4 Unidade, 5 NCM, 7 Preço, 10 Situação,
- * 12 Preço de custo, 13 Cód fornecedor, 18 Peso líquido, 19 Peso bruto,
- * 20 GTIN/EAN, 22 Largura, 23 Altura, 24 Profundidade, 39 Marca,
- * 41 Volumes, 42 Descrição curta, 44+ Imagens (urls extras)
+ * Parser da BN (22 colunas + URLs extras de imagens).
+ * Atualiza TUDO que vier preenchido (exceto Fornecedor/Tags).
+ * Imagens: REPLACE quando vierem (a rota decide enviar).
  */
 export function parseBNAndNormalize(bnText: string) {
   const raw = bnText.replace(/\r\n/g, "\n").trim();
 
-  // consolida tudo numa linha (o usuário às vezes cola HTML com quebras)
-  let line = raw;
-  // tira aspas e asteriscos externos
-  line = stripOuterQuotesAndAsterisks(line);
-  // remove tabs e normaliza espaços
+  let line = stripOuterQuotesAndAsterisks(raw);
   line = normalizeSpacesAndTabs(line);
 
-  // substitui "|    |" e "| \t|" edge-cases -> "| |" já cobertos pelo normalize
-  // split primário por "|"
   let parts = line.split("|").map((p) => p.trim());
-
-  // Se o usuário traz pipes dentro de HTML, já removemos HTML ao extrair col 42
   const get = (idx1: number) => (parts[idx1 - 1] ?? "").trim();
 
-  // imagens: podem vir nas colunas 44 em diante OU tudo na mesma coluna separado por vírgula
+  // Coleta imagens da col. 44 em diante
   let imagesRaw: string[] = [];
   if (parts.length >= 44) {
-    imagesRaw = parts.slice(44 - 1).flatMap((p) =>
-      p.split(",").map((u) => u.trim()).filter(Boolean)
-    );
-    // reduz vetor original para 43 posições para não confundir contagem
+    imagesRaw = parts.slice(43).flatMap((p) => p.split(",").map((u) => u.trim()).filter(Boolean));
     parts = parts.slice(0, 43);
   }
 
-  // campos
+  // Campos (1..22)
   const idStr = get(1);
-  const id = onlyDigits(idStr) || idStr; // mantém string caso ID não seja só dígitos
+  const id = onlyDigits(idStr) || idStr;
   const code = get(2) || undefined;
   const name = get(3) || undefined;
   const unit = get(4) || undefined;
-  const ncm = onlyDigits(get(5)) || undefined; // "94049000"
+  const ncm = onlyDigits(get(5)) || undefined;
   const price = toFloatPtBR(get(7));
-  const situacao = mapSituacao(get(10)); // "A"/"I"
+  const situacao = mapSituacao(get(10));
   const costPrice = toFloatPtBR(get(12));
-  const supplierCode = get(13) || undefined; // NÃO será enviado
+  const supplierCode = get(13) || undefined; // NÃO enviar nome do fornecedor (col. 14)
   const netWeight = toFloatPtBR(get(18));
   const grossWeight = toFloatPtBR(get(19));
   const ean = onlyDigits(get(20)) || undefined;
@@ -63,13 +50,12 @@ export function parseBNAndNormalize(bnText: string) {
   const volumes = toNumber(get(41));
   const shortDesc = stripHtmlToText(get(42) || "");
 
-  // normaliza imagens (http/https apenas)
-  const images = imagesRaw
-    .map((u) => u.replace(/^\s+|\s+$/g, ""))
-    .filter((u) => /^https?:\/\//i.test(u));
+  // Normaliza imagens (http/https)
+  const images = imagesRaw.filter((u) => /^https?:\/\//i.test(u));
 
-  // monta payload de PATCH (somente presentes)
+  // Corpo PATCH (dialeto Bling v3 — campos em pt)
   const patch: Record<string, any> = {};
+  if (id) patch.id = id; // usado só para resolver
   if (code) patch.codigo = code;
   if (name) patch.nome = name;
   if (unit) patch.unidade = unit;
@@ -77,7 +63,7 @@ export function parseBNAndNormalize(bnText: string) {
   if (typeof price === "number") patch.preco = price;
   if (situacao) patch.situacao = situacao;
   if (typeof costPrice === "number") patch.precoCusto = costPrice;
-  // fornecedor/tag não enviamos no PATCH
+  if (supplierCode) patch.codigoFornecedor = supplierCode; // OBS: nome do fornecedor não enviamos
   if (typeof netWeight === "number") patch.pesoLiquido = netWeight;
   if (typeof grossWeight === "number") patch.pesoBruto = grossWeight;
   if (ean) patch.gtin = ean;
@@ -88,25 +74,29 @@ export function parseBNAndNormalize(bnText: string) {
   if (typeof volumes === "number") patch.volumes = volumes;
   if (shortDesc) patch.descricaoCurta = shortDesc;
 
-  // imagens ficam para uma 2ª chamada dedicada, mas retornamos aqui para a rota decidir
-  const resultItem = {
-    id,
-    bnLine: parts.join("|"),
-    patchPayload: patch,
-    images,
-  };
+  // BN limpa para preview (mantém primeiras 43 colunas + CSV de imagens no final)
+  const cleaned = parts.join("|") + (images.length ? "|" + images.join(",") : "");
 
   return {
-    cleaned_lines: [resultItem.bnLine + (images.length ? "|" + images.join(",") : "")],
-    errors: [], // validações críticas podem ser adicionadas aqui
-    items: [resultItem],
+    cleaned_lines: [cleaned],
+    errors: [],
+    items: [
+      {
+        id,
+        bnLine: cleaned,
+        patchPayload: patch,
+        images
+      }
+    ]
   };
 }
 
-/**
- * Constrói corpo final do PATCH (já vem "seletivo")
- * (mantido por semântica/legibilidade na rota)
- */
 export function toBlingPatchBody(patch: Record<string, any>) {
-  return patch;
+  const body: Record<string, any> = {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === "" || v === null || v === undefined) continue;
+    if (k === "tags" || k === "fornecedor" || k === "supplier") continue;
+    body[k] = v;
+  }
+  return body;
 }

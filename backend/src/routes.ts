@@ -1,135 +1,74 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { Router } from "express";
+import crypto from "crypto";
 import { requireAuth } from "./tokenStore.js";
 import { parseBNAndNormalize, toBlingPatchBody } from "./services.js";
-import crypto from "crypto";
+import { patchProdutoById, putImagensReplace, patchProdutoImagensFallback } from "./blingClient.js";
 
-const router = Router();
+export const router = Router(); // named export
 
-// Health
-router.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "bling-updater-backend" });
-});
+router.get("/health", (_req, res) => res.json({ ok: true, service: "bling-updater-backend" }));
 
-// Preview: limpa e normaliza BN 22 colunas (aceita colas com HTML, aspas, *)
+// Preview — aceita body { bn } ou { text }
 router.post("/bling/preview", (req, res) => {
   try {
-    const { text } = req.body || {};
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ ok: false, error: { message: "Body.text é obrigatório" } });
-    }
-    const parsed = parseBNAndNormalize(text);
-    // evita 'ok' duplicado
+    const body = req.body || {};
+    const txt = typeof body.bn === "string" ? body.bn : body.text;
+    if (!txt) return res.status(400).json({ ok: false, error: { message: "Body.bn (ou text) é obrigatório" } });
+    const parsed = parseBNAndNormalize(txt);
     return res.json({ ok: true, ...parsed });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: { message: e?.message || "Erro" } });
   }
 });
 
-// PATCH seletivo no Bling por ID (coluna 1). Imagens em 2ª chamada (best effort).
+/**
+ * PATCH parcial:
+ * - Chave primária: ID (coluna 1). Se faltar, erro 400.
+ * - Atualiza só campos enviados (exceto fornecedor/tags)
+ * - Imagens: se vierem URLs -> REPLACE (endpoint dedicado; fallback se necessário)
+ */
 router.post("/bling/patch", requireAuth, async (req, res) => {
   const accessToken: string = (req as any).accessToken;
   try {
-    const { text } = req.body || {};
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ ok: false, error: { message: "Body.text é obrigatório" } });
-    }
+    const bodyIn = req.body || {};
+    const txt = typeof bodyIn.bn === "string" ? bodyIn.bn : bodyIn.text;
+    if (!txt) return res.status(400).json({ ok: false, error: { message: "Body.bn (ou text) é obrigatório" } });
 
-    const parsed = parseBNAndNormalize(text);
+    const parsed = parseBNAndNormalize(txt);
     const item = parsed.items[0];
-    if (!item?.id) {
-      return res.status(400).json({ ok: false, error: { message: "ID (coluna 1) é obrigatório" } });
-    }
+    if (!item?.id) return res.status(400).json({ ok: false, error: { message: "ID (col.1) é obrigatório" } });
 
-    const body = toBlingPatchBody(item.patchPayload);
-    const idem = crypto.randomUUID();
+    const idem = (req.headers["idempotency-key"] as string) || crypto.randomUUID();
+    const patchBody = toBlingPatchBody(item.patchPayload);
 
-    // PATCH principal (campos: preço, ncm, unidade, pesos, medidas, volumes, gtin, marca, nome, etc.)
-    const r1 = await fetch(`https://www.bling.com.br/Api/v3/produtos/${encodeURIComponent(item.id)}`, {
-      method: "PATCH",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Idempotency-Key": idem,
-      },
-      body: JSON.stringify(body),
-    });
+    // 1) PATCH principal
+    const r1 = await patchProdutoById(accessToken, item.id, patchBody, idem);
 
-    const j1 = await r1.json().catch(() => ({}));
-    if (!r1.ok) {
-      return res.status(r1.status).json({
-        ok: false,
-        stage: "patchProduto",
-        error: { status: r1.status, message: j1, payload: j1 },
-      });
-    }
-
-    // Imagens (opcional): tentamos atualizar se vieram URLs
-    let imagesResult: any = null;
+    // 2) Imagens (opcional — replace)
+    let imagesResult: any = { skipped: true };
     if (item.images?.length) {
-      // Estratégia "best-effort": alguns tenants exigem configuração de "URL de imagens" no cadastro.
-      // Enviamos em endpoint dedicado (quando disponível) ou no próprio produto,
-      // priorizando não travar o update dos demais campos.
-      const idem2 = crypto.randomUUID();
-
-      // Tentativa 1: endpoint dedicado (com 'substituir')
-      const rImg = await fetch(
-        `https://www.bling.com.br/Api/v3/produtos/${encodeURIComponent(item.id)}/imagens`,
-        {
-          method: "PUT", // conjunto completo (replace)
-          headers: {
-            "Authorization": `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Idempotency-Key": idem2,
-          },
-          body: JSON.stringify({
-            substituir: true,
-            imagens: item.images.map((url: string) => ({ url })),
-          }),
+      try {
+        imagesResult = await putImagensReplace(accessToken, item.id, item.images, crypto.randomUUID());
+      } catch (err1: any) {
+        try {
+          imagesResult = await patchProdutoImagensFallback(accessToken, item.id, item.images, crypto.randomUUID());
+        } catch (err2: any) {
+          imagesResult = { skipped: true, error: err2?.data ?? err1?.data ?? "imagens failed" };
         }
-      );
-
-      if (rImg.ok) {
-        imagesResult = await rImg.json().catch(() => ({}));
-      } else {
-        // Tentativa 2: PATCH no próprio produto (fallback) — se a API aceitar este formato
-        const rImg2 = await fetch(
-          `https://www.bling.com.br/Api/v3/produtos/${encodeURIComponent(item.id)}`,
-          {
-            method: "PATCH",
-            headers: {
-              "Authorization": `Bearer ${accessToken}`,
-              "Content-Type": "application/json",
-              "Accept": "application/json",
-              "Idempotency-Key": crypto.randomUUID(),
-            },
-            body: JSON.stringify({
-              imagens: {
-                substituir: true,
-                urls: item.images,
-              },
-            }),
-          }
-        );
-        imagesResult = rImg2.ok ? await rImg2.json().catch(() => ({})) : { skipped: true, status: rImg.status };
       }
     }
 
-    // sucesso
     return res.json({
       ok: true,
-      preview: parsed,
-      result: j1,
-      images: imagesResult ?? { skipped: true },
+      patch: r1,
+      images: imagesResult,
+      preview: parsed
     });
   } catch (e: any) {
-    return res.status(500).json({
-      ok: false,
-      stage: "patchProduto",
-      error: { message: e?.message || "Erro inesperado" },
-    });
+    const status = e?.status || e?.response?.status || 500;
+    return res.status(status).json({ ok: false, error: e?.data || e?.response?.data || { message: e?.message || "Erro" } });
   }
 });
 
-export default router;
+export default router; // default export também
