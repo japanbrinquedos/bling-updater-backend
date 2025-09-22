@@ -1,196 +1,172 @@
-import { clamp, dedupe, hasHtml, onlyDigits, parseBNLineToColumns, parseNumber, splitBNRecords, stripHtml, truncate } from "./utils.js";
+import { getAccessToken } from "./tokenStore.js";
+import { blingGetProduct, blingFindByCodeOrEan, blingPatchProduct, blingPutImages } from "./blingClient.js";
 
-// Índices (0-based) nas 22 colunas BN
-const IDX = {
-  ID: 0,
-  CODIGO: 1,
-  NOME: 2,
-  UNIDADE: 3,
-  NCM: 4,
-  PRECO: 5,
-  SITUACAO: 6,
-  PRECO_CUSTO: 7,
-  COD_FORNEC: 8,
-  FORNEC: 9,               // NÃO ENVIAR
-  PESO_LIQ: 10,
-  PESO_BRU: 11,
-  EAN: 12,
-  LARGURA: 13,
-  ALTURA: 14,
-  PROFUNDIDADE: 15,
-  TAGS: 16,                // NÃO ENVIAR
-  COD_PAI: 17,             // NÃO ENVIAR
-  MARCA: 18,
-  VOLUMES: 19,
-  DESC_CURTA: 20,          // texto simples OU HTML
-  IMAGENS: 21              // pode conter muitas (e extras após 22)
+type PreviewItem = {
+  id?: string;
+  code?: string;
+  ean?: string;
+  images?: string[];
+  patchPayload: Record<string, any>;
+  warnings: string[];
 };
 
-function normUnidade(v: string) {
-  return (v || "UN").toUpperCase().slice(0, 6);
+const DEC = /(\d+),(\d{1,})/g;
+
+function toNum(v?: string) {
+  if (!v) return undefined;
+  const n = Number(v.replace(DEC, "$1.$2"));
+  return Number.isFinite(n) ? n : undefined;
 }
+function onlyDigits(s?: string) { return s ? s.replace(/\D+/g, "") : s; }
 
-function normSituacao(v: string) {
-  const s = (v || "").toLowerCase();
-  if (s.startsWith("a")) return "A";
-  if (s.startsWith("i")) return "I";
-  return undefined;
-}
-
-function normMarca(v: string) {
-  return (v || "").trim().toUpperCase();
-}
-
-function ncmDigits(v: string) {
-  const d = onlyDigits(v);
-  if (d.length === 8) return d;
-  return "";
-}
-
-function normPeso(v: string) {
-  const n = parseNumber(v, 1);
-  if (n === undefined) return undefined;
-  return clamp(n, 0, 50);
-}
-
-function normDim(v: string) {
-  const n = parseNumber(v, 1);
-  if (n === undefined) return undefined;
-  return clamp(n, 0.5, 200);
-}
-
-export function parseBNAndNormalize(raw: string) {
-  const records = splitBNRecords(raw);
-  const cleaned_lines: string[] = [];
-  const errors: string[] = [];
-  const items: any[] = [];
-
-  records.forEach((rec, idx) => {
-    const { cols, images } = parseBNLineToColumns(rec);
-
-    if (!cols[IDX.ID]) {
-      errors.push(`Linha ${idx + 1}: ID ausente`);
-    }
-
-    // Normalizações de campos
-    const id = cols[IDX.ID]?.trim();
-    const codigo = cols[IDX.CODIGO]?.trim();
-    const nome = cols[IDX.NOME]?.trim();
-    const unidade = normUnidade(cols[IDX.UNIDADE]);
-    const ncm = ncmDigits(cols[IDX.NCM]);
-    const preco = parseNumber(cols[IDX.PRECO], 2);
-    const situacao = normSituacao(cols[IDX.SITUACAO]);
-    const precoCusto = parseNumber(cols[IDX.PRECO_CUSTO], 2);
-    const codFornecedor = cols[IDX.COD_FORNEC]?.trim();
-    const fornecedor = cols[IDX.FORNEC]?.trim(); // NÃO ENVIAR
-    const pesoLiquido = normPeso(cols[IDX.PESO_LIQ]);
-    const pesoBruto = normPeso(cols[IDX.PESO_BRU]);
-    const ean = cols[IDX.EAN]?.trim();
-    const largura = normDim(cols[IDX.LARGURA]);
-    const altura = normDim(cols[IDX.ALTURA]);
-    const profundidade = normDim(cols[IDX.PROFUNDIDADE]);
-    const tags = cols[IDX.TAGS];                // NÃO ENVIAR
-    const codigoPai = cols[IDX.COD_PAI];        // NÃO ENVIAR
-    const marca = normMarca(cols[IDX.MARCA]);
-    const volumes = parseNumber(cols[IDX.VOLUMES], 0) ?? 0;
-
-    const descCol = cols[IDX.DESC_CURTA] || "";
-    let descricaoCurta = "";
-    let descricaoHtml: string | undefined = undefined;
-    if (hasHtml(descCol)) {
-      descricaoHtml = descCol.trim();
-      descricaoCurta = truncate(stripHtml(descCol), 500);
-    } else {
-      descricaoCurta = truncate(descCol.trim(), 500);
-    }
-
-    // Monta cleaned_line (22 colunas) para preview
-    const cleanedCols = [...cols];
-    cleanedCols[IDX.UNIDADE] = unidade;
-    cleanedCols[IDX.NCM] = ncm || cols[IDX.NCM];
-    cleanedCols[IDX.PRECO] = preco !== undefined ? String(preco) : cols[IDX.PRECO];
-    cleanedCols[IDX.SITUACAO] = situacao || cols[IDX.SITUACAO];
-    cleanedCols[IDX.PRECO_CUSTO] = precoCusto !== undefined ? String(precoCusto) : cols[IDX.PRECO_CUSTO];
-    cleanedCols[IDX.PESO_LIQ] = pesoLiquido !== undefined ? String(pesoLiquido) : cols[IDX.PESO_LIQ];
-    cleanedCols[IDX.PESO_BRU] = pesoBruto !== undefined ? String(pesoBruto) : cols[IDX.PESO_BRU];
-    cleanedCols[IDX.LARGURA] = largura !== undefined ? String(largura) : cols[IDX.LARGURA];
-    cleanedCols[IDX.ALTURA] = altura !== undefined ? String(altura) : cols[IDX.ALTURA];
-    cleanedCols[IDX.PROFUNDIDADE] = profundidade !== undefined ? String(profundidade) : cols[IDX.PROFUNDIDADE];
-    cleanedCols[IDX.MARCA] = marca || cols[IDX.MARCA];
-    cleanedCols[IDX.VOLUMES] = String(volumes);
-
-    // Coluna de imagens no preview: juntar por vírgula
-    cleanedCols[IDX.IMAGENS] = dedupe(images).join(",");
-
-    // warnings
-    const warnings: string[] = [];
-    if (!ncm && cols[IDX.NCM]) warnings.push("ncm_invalid_digits");
-    if (fornecedor) warnings.push("supplier_not_patched"); // lembrar que não envia
-    if (tags) warnings.push("tags_not_patched");
-    if (codigoPai) warnings.push("codigo_pai_not_patched");
-
-    // PATCH payload parcial (SOMENTE campos presentes/válidos)
-    const patch: Record<string, any> = {};
-    if (codigo) patch.codigo = codigo;
-    if (nome) patch.nome = nome;
-    if (unidade) patch.unidade = unidade;
-    if (ncm) patch.ncm = ncm;
-    if (preco !== undefined) patch.preco = preco;
-    if (situacao) patch.situacao = situacao;
-    if (precoCusto !== undefined) patch.precoCusto = precoCusto;
-    if (codFornecedor) patch.codigoFornecedor = codFornecedor;
-    if (pesoLiquido !== undefined) patch.pesoLiquido = pesoLiquido;
-    if (pesoBruto !== undefined) patch.pesoBruto = pesoBruto;
-    if (ean) patch.ean = ean;
-    if (largura !== undefined) patch.largura = largura;
-    if (altura !== undefined) patch.altura = altura;
-    if (profundidade !== undefined) patch.profundidade = profundidade;
-    if (marca) patch.marca = marca;
-    if (volumes !== undefined) patch.volumes = volumes;
-
-    // descrição: curta sempre, html quando existir
-    if (descricaoCurta) patch.descricaoCurta = descricaoCurta;
-    if (descricaoHtml) patch.descricao = descricaoHtml;
-
-    // NUNCA enviar estes campos:
-    // tipo, formato, fornecedor (10), tags (17), codigoPai (18)
-
-    cleaned_lines.push(cleanedCols.join("|"));
-
-    items.push({
-      id,
-      bnLine: cleanedCols.join("|"),
-      images,
-      warnings,
-      patchPayload: patch
-    });
-  });
-
-  return { cleaned_lines, items, errors };
-}
-
-// Build skeleton (22 colunas) a partir de *ID|Codigo|Descricao*
-export function buildSkeletonFromSeeds(seedsRaw: string) {
-  const records = splitBNRecords(seedsRaw); // também aceita *…* e/ou linhas
-  const out: string[] = [];
-
-  for (const r of records) {
-    let t = r.trim();
-    if (t.startsWith("*") && t.endsWith("*")) t = t.slice(1, -1);
-    t = t.replace(/\t/g, "|");
-    const parts = t.split("|").map(s => s.trim());
-    let id = "", codigo = "", nome = "";
-    if (parts.length === 1) nome = parts[0];
-    if (parts.length >= 2) { id = parts[0]; codigo = parts[1]; }
-    if (parts.length >= 3) nome = parts[2];
-
-    const cols = Array(22).fill("") as string[];
-    cols[IDX.ID] = id;
-    cols[IDX.CODIGO] = codigo;
-    cols[IDX.NOME] = nome;
-    cols[IDX.UNIDADE] = "UN";
-    // demais defaults vazios; col 22 imagens vazia
-    out.push(cols.join("|"));
+function sanitizeRawBlock(raw: string) {
+  let s = raw.trim();
+  if (s.startsWith("*")) s = s.slice(1);
+  if (s.endsWith("*")) s = s.slice(0, -1);
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
   }
-  return out;
+  s = s.replaceAll("\t", "|");
+  s = s.replace(/\r?\n+/g, " ");
+  return s;
+}
+
+function split22(line: string) {
+  const parts = line.split("|").map(p => p.trim());
+  if (parts.length < 22) {
+    while (parts.length < 22) parts.push("");
+  } else if (parts.length > 22) {
+    const extra = parts.splice(22);
+    parts[21] = [parts[21], ...extra].filter(Boolean).join(",");
+  }
+  return parts;
+}
+
+function mapToPatch(line: string): PreviewItem {
+  const p = split22(line);
+
+  const id      = p[0] || undefined;
+  const code    = p[1] || undefined;
+  const name    = p[2] || undefined;
+
+  const unit    = p[3] || undefined;
+  const ncm     = onlyDigits(p[4]) || undefined;
+
+  const price   = toNum(p[5]);
+  const status  = (p[6] || "").toLowerCase().startsWith("a") ? "A" :
+                  (p[6] || "").toLowerCase().startsWith("i") ? "I" : undefined;
+
+  const cost    = toNum(p[7]);
+  const supplier_code = p[8] || undefined;
+  // p[9] fornecedor -> não envia
+
+  const net_weight   = toNum(p[10]);
+  const gross_weight = toNum(p[11]);
+  const ean          = onlyDigits(p[12]) || undefined;
+
+  const width_cm  = toNum(p[13]);
+  const height_cm = toNum(p[14]);
+  const depth_cm  = toNum(p[15]);
+
+  // p[16] tags (ignorar)
+  // p[17] codigo_pai (ignorar)
+
+  const brand   = (p[18] || "").toUpperCase() || undefined;
+  const volumes = p[19] !== "" ? Number(p[19]) : undefined;
+
+  const short_description = p[20] || undefined; // **HTML preservado**
+  const images = (p[21] || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(s => !!s);
+
+  const patchPayload: Record<string, any> = {
+    // contratos Bling – parcial:
+    tipo: "P",
+    formato: "S",
+  };
+  if (code)  patchPayload.codigo = code;
+  if (name)  patchPayload.nome = name;
+  if (unit)  patchPayload.unidade = unit;
+  if (ncm)   patchPayload.ncm = ncm;
+  if (typeof price === "number") patchPayload.preco = price;
+  if (status) patchPayload.situacao = status;
+  if (typeof cost === "number") patchPayload.precoCusto = cost;
+  if (supplier_code) patchPayload.codigoFornecedor = supplier_code;
+  if (typeof net_weight === "number") patchPayload.pesoLiquido = net_weight;
+  if (typeof gross_weight === "number") patchPayload.pesoBruto = gross_weight;
+  if (ean)   patchPayload.gtin = ean;
+  if (typeof width_cm  === "number") patchPayload.largura = width_cm;
+  if (typeof height_cm === "number") patchPayload.altura = height_cm;
+  if (typeof depth_cm  === "number") patchPayload.profundidade = depth_cm;
+  if (brand) patchPayload.marca = brand;
+  if (typeof volumes === "number") patchPayload.volumes = volumes;
+  if (short_description) patchPayload.descricaoCurta = short_description;
+
+  return { id, code, ean, images, patchPayload, warnings: [] };
+}
+
+export function parseBNAndNormalize(bn: string) {
+  const blocks: string[] = [];
+  const starMatches = bn.match(/\*[\s\S]*?\*/g);
+  if (starMatches?.length) {
+    for (const m of starMatches) blocks.push(sanitizeRawBlock(m));
+  } else {
+    bn.split(/\r?\n/).forEach(L => {
+      const s = sanitizeRawBlock(L);
+      if (s) blocks.push(s);
+    });
+  }
+  const items = blocks.map(mapToPatch);
+  return { ok: true, cleaned_lines: blocks, items, errors: [] };
+}
+
+async function resolveBlingId(item: PreviewItem, token: string): Promise<{ id?: string }> {
+  if (item.id) {
+    const got = await blingGetProduct(item.id, token);
+    if (got?.ok) return { id: item.id };
+  }
+  const found = await blingFindByCodeOrEan(item.code, item.ean, token);
+  if (found?.id) return { id: String(found.id) };
+  return { id: undefined };
+}
+
+export async function patchFromBN(bn: string) {
+  const token = await getAccessToken();
+  const preview = parseBNAndNormalize(bn);
+  const results: any[] = [];
+  const failures: any[] = [];
+
+  for (const it of preview.items) {
+    try {
+      const { id: blingId } = await resolveBlingId(it, token);
+      if (!blingId) {
+        failures.push({ id: it.id || it.code || it.ean, error: { status: 404, message: "product_not_found" } });
+        continue;
+      }
+      const patchRes = await blingPatchProduct(blingId, it.patchPayload, token);
+
+      // imagens = best-effort (warning, não falha do lote)
+      let imageWarn: string | undefined;
+      if (it.images && it.images.length) {
+        try { await blingPutImages(blingId, it.images, token); }
+        catch { imageWarn = "images_update_failed"; }
+      }
+
+      results.push({
+        id: blingId,
+        source: it.id || it.code || it.ean,
+        imageWarn,
+        patchPayload: it.patchPayload,
+        bling: patchRes?.data ?? null
+      });
+    } catch (e: any) {
+      failures.push({
+        id: it.id || it.code || it.ean,
+        error: { status: e?.status || 500, message: e?.message || String(e) }
+      });
+    }
+  }
+
+  return { ok: failures.length === 0, results, failures, preview };
 }

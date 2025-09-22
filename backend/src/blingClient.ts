@@ -1,73 +1,55 @@
-import { getValidAccessToken } from "./tokenStore.js";
-import { safeJson, sleep } from "./utils.js";
-
 const API = "https://www.bling.com.br/Api/v3";
 
-type FetchOpts = {
-  method?: string;
-  headers?: Record<string, string>;
-  body?: any;
-  idempotencyKey?: string;
-};
-
-async function blingFetch(path: string, opts: FetchOpts = {}, retry = 0): Promise<any> {
-  const token = await getValidAccessToken();
-  const headers: Record<string, string> = {
+function hdr(token: string) {
+  return {
     "Authorization": `Bearer ${token}`,
     "Accept": "application/json",
-    ...(opts.body ? { "Content-Type": "application/json" } : {}),
-    ...(opts.headers || {})
+    "Content-Type": "application/json"
   };
-  if (opts.idempotencyKey) headers["Idempotency-Key"] = opts.idempotencyKey;
-
-  const res = await fetch(`${API}${path}`, {
-    method: opts.method || "GET",
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined
-  });
-
-  const text = await res.text();
-  const json = (() => { try { return JSON.parse(text); } catch { return text; } })();
-
-  if (res.ok) return json;
-
-  // Retry leve para 429/5xx
-  if ((res.status === 429 || res.status >= 500) && retry < 2) {
-    await sleep(300 + retry * 500);
-    return blingFetch(path, opts, retry + 1);
-  }
-  const err = new Error(`bling_error ${res.status}: ${safeJson(json)}`);
-  (err as any).status = res.status;
-  (err as any).payload = json;
-  throw err;
 }
 
-export async function patchProduct(id: string, payload: Record<string, any>, idempotencyKey?: string) {
-  return blingFetch(`/produtos/${encodeURIComponent(id)}`, {
+export async function blingGetProduct(id: string, token: string) {
+  const r = await fetch(`${API}/produtos/${encodeURIComponent(id)}`, { headers: hdr(token) });
+  if (r.status === 404) return { ok: false, status: 404 };
+  const data = await r.json().catch(() => null);
+  return { ok: r.ok, status: r.status, data };
+}
+
+export async function blingFindByCodeOrEan(code?: string, ean?: string, token?: string) {
+  if (!token) throw new Error("token_missing");
+  const qs: string[] = [];
+  if (code) qs.push(`codigo=${encodeURIComponent(code)}`);
+  if (ean)  qs.push(`gtin=${encodeURIComponent(ean)}`);
+  if (!qs.length) return {};
+  const r = await fetch(`${API}/produtos?${qs.join("&")}&pagina=1&limite=1`, { headers: hdr(token) });
+  if (!r.ok) return {};
+  const j = await r.json().catch(() => null);
+  const first = j?.data?.[0] || j?.[0] || null;
+  return first || {};
+}
+
+export async function blingPatchProduct(id: string, payload: Record<string, any>, token: string) {
+  const r = await fetch(`${API}/produtos/${encodeURIComponent(id)}`, {
     method: "PATCH",
-    body: payload,
-    idempotencyKey
+    headers: hdr(token),
+    body: JSON.stringify(payload)
   });
+  const data = await r.json().catch(() => null);
+  if (!r.ok) throw { status: r.status, message: `bling_error ${r.status}: ${JSON.stringify(data)}` };
+  return { ok: true, data };
 }
 
-export async function putProductImages(id: string, urls: string[], idempotencyKey?: string) {
-  // Substitui todas as imagens do produto (replace)
-  const body = { urls };
-  return blingFetch(`/produtos/${encodeURIComponent(id)}/imagens`, {
+// Best-effort (se falhar vira warning)
+export async function blingPutImages(id: string, urls: string[], token: string) {
+  if (!urls.length) return;
+  const body = { imagens: urls.map(u => ({ url: u })) };
+  const r = await fetch(`${API}/produtos/${encodeURIComponent(id)}/imagens`, {
     method: "PUT",
-    body,
-    idempotencyKey
+    headers: hdr(token),
+    body: JSON.stringify(body)
   });
-}
-
-export function buildAuthorizeUrl(state: string) {
-  const base = "https://www.bling.com.br/Api/v3/oauth/authorize";
-  const p = new URLSearchParams({
-    response_type: "code",
-    client_id: process.env.BLING_CLIENT_ID || "",
-    redirect_uri: process.env.BLING_REDIRECT_URI || "",
-    scope: process.env.BLING_SCOPE || "produtos",
-    state
-  });
-  return `${base}?${p.toString()}`;
+  if (!r.ok) {
+    const data = await r.json().catch(() => null);
+    throw { status: r.status, message: `bling_images_error ${r.status}: ${JSON.stringify(data)}` };
+  }
 }
