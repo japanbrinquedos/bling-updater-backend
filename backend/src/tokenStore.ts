@@ -1,79 +1,158 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import type { Request, Response, NextFunction } from "express";
+import { safeJson, sleep } from "./utils.js";
 
-type TokenBundle = {
+type TokenBag = {
   access_token: string;
+  token_type?: string;
+  expires_in?: number;
   refresh_token?: string;
-  expires_at?: number;
   scope?: string;
 };
 
-const MEM: { token?: TokenBundle } = {};
+type Persisted = {
+  access_token: string;
+  refresh_token?: string;
+  scope?: string;
+  expires_at: number; // epoch ms
+};
 
-export function setTokenBundle(tb: TokenBundle) { MEM.token = tb; }
-export function getTokenBundle(): TokenBundle | undefined { return MEM.token; }
-export function getStatus() {
-  if (!MEM.token) return { authenticated: false };
-  const now = Math.floor(Date.now() / 1000);
-  const ttl = (MEM.token.expires_at ?? 0) - now;
-  return { authenticated: true, expires_in: ttl, has_refresh: !!MEM.token.refresh_token, scope: MEM.token.scope ?? null };
+const memory: { tokens?: Persisted } = {};
+
+const TOKENS_PATH = "/tmp/bling_tokens.json";
+
+async function readFile(path: string): Promise<string | null> {
+  try {
+    const fs = await import("fs/promises");
+    return await fs.readFile(path, "utf8");
+  } catch { return null; }
+}
+async function writeFile(path: string, data: string): Promise<void> {
+  try {
+    const fs = await import("fs/promises");
+    await fs.writeFile(path, data, "utf8");
+  } catch { /* noop */ }
 }
 
-export async function ensureFreshAccessToken(): Promise<string | null> {
-  const tb = MEM.token;
-  if (!tb?.access_token) return null;
+async function loadFromDisk() {
+  const txt = await readFile(TOKENS_PATH);
+  if (!txt) return;
+  try {
+    const obj = JSON.parse(txt) as Persisted;
+    if (obj?.access_token) memory.tokens = obj;
+  } catch { /* ignore */ }
+}
+loadFromDisk();
 
-  const now = Math.floor(Date.now() / 1000);
-  if ((tb.expires_at ?? now + 999999) - now > 60) return tb.access_token;
+function saveToDisk() {
+  if (!memory.tokens) return;
+  writeFile(TOKENS_PATH, JSON.stringify(memory.tokens));
+}
 
-  if (!tb.refresh_token) return tb.access_token;
+function now() { return Date.now(); }
 
-  const client_id = process.env.BLING_CLIENT_ID!;
-  const client_secret = process.env.BLING_CLIENT_SECRET!;
-  const basic = Buffer.from(`${client_id}:${client_secret}`).toString("base64");
+function basicAuthHeader() {
+  const id = process.env.BLING_CLIENT_ID || "";
+  const sec = process.env.BLING_CLIENT_SECRET || "";
+  const b64 = Buffer.from(`${id}:${sec}`).toString("base64");
+  return `Basic ${b64}`;
+}
 
+export function getStatus() {
+  const t = memory.tokens;
+  if (!t) return { ok: true, authenticated: false, expires_in: 0, has_refresh: false, scope: null as string | null };
+  const expires_in = Math.max(0, Math.floor((t.expires_at - now()) / 1000));
+  return { ok: true, authenticated: true, expires_in, has_refresh: Boolean(t.refresh_token), scope: t.scope || null };
+}
+
+export async function exchangeCodeForToken(code: string) {
+  const url = "https://www.bling.com.br/Api/v3/oauth/token";
   const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: tb.refresh_token
-    // credenciais via Basic
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: process.env.BLING_REDIRECT_URI || ""
   });
 
-  const r = await fetch("https://www.bling.com.br/Api/v3/oauth/token", {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
+      "Authorization": basicAuthHeader(),
       "Content-Type": "application/x-www-form-urlencoded",
-      "Authorization": `Basic ${basic}`
+      "Accept": "application/json"
     },
     body
   });
 
-  const j: any = await r.json().catch(() => ({}));
-  if (!r.ok || !j.access_token) {
-    // fallback: mantém o token antigo para não travar operações
-    return tb.access_token;
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    throw new Error(`token_exchange_failed: ${safeJson(data)}`);
   }
-  const expires_at = Math.floor(Date.now() / 1000) + (Number(j.expires_in ?? 3600) - 60);
-  setTokenBundle({
-    access_token: j.access_token,
-    refresh_token: j.refresh_token ?? tb.refresh_token,
-    expires_at,
-    scope: j.scope,
-  });
-  return j.access_token;
+  const bag = data as TokenBag;
+  const expires_at = now() + Math.max(5, (bag.expires_in || 1800) - 30) * 1000;
+  memory.tokens = {
+    access_token: bag.access_token,
+    refresh_token: bag.refresh_token,
+    scope: bag.scope,
+    expires_at
+  };
+  saveToDisk();
+  return getStatus();
 }
 
-export async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const auth = req.headers.authorization || "";
-  const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
-  const headerToken = (req.headers["x-access-token"] as string) || null;
-  const envToken = process.env.BLING_ACCESS_TOKEN || null;
+export async function refreshToken() {
+  const t = memory.tokens;
+  if (!t?.refresh_token) throw new Error("no_refresh_token");
 
-  let token: string | null = bearer || headerToken || envToken || null;
-  if (!token && MEM.token?.access_token) token = await ensureFreshAccessToken();
+  const url = "https://www.bling.com.br/Api/v3/oauth/token";
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: t.refresh_token
+  });
 
-  if (!token) {
-    return res.status(401).json({ ok: false, error: { message: "Sem access_token. Acesse /auth/start para conectar ao Bling." } });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": basicAuthHeader(),
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json"
+    },
+    body
+  });
+
+  const data = await res.json().catch(() => ({} as any));
+  if (!res.ok) {
+    throw new Error(`token_refresh_failed: ${safeJson(data)}`);
   }
-  (req as any).accessToken = token;
+  const bag = data as TokenBag;
+  const expires_at = now() + Math.max(5, (bag.expires_in || 1800) - 30) * 1000;
+  memory.tokens = {
+    access_token: bag.access_token,
+    refresh_token: bag.refresh_token || t.refresh_token,
+    scope: bag.scope || t.scope,
+    expires_at
+  };
+  saveToDisk();
+  return getStatus();
+}
+
+export async function getValidAccessToken(): Promise<string> {
+  // atalho dev: BLING_ACCESS_TOKEN
+  if (process.env.BLING_ACCESS_TOKEN) return process.env.BLING_ACCESS_TOKEN;
+
+  const t = memory.tokens;
+  if (!t) throw new Error("not_authenticated");
+  const remaining = t.expires_at - now();
+  if (remaining < 20 * 1000) {
+    await refreshToken();
+    return memory.tokens!.access_token;
+  }
+  return t.access_token;
+}
+
+// Middleware simples: exige auth
+import type { Request, Response, NextFunction } from "express";
+export function requireAuth(_req: Request, res: Response, next: NextFunction) {
+  if (!memory.tokens?.access_token) {
+    res.status(401).json({ ok: false, error: "unauthenticated" });
+    return;
+  }
   next();
 }

@@ -1,130 +1,125 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { Router } from "express";
-import crypto from "crypto";
-import { requireAuth, setTokenBundle, getStatus, ensureFreshAccessToken } from "./tokenStore.js";
-import { parseBNAndNormalize, toBlingPatchBody } from "./services.js";
-import { patchProdutoById, putImagensReplace, patchProdutoImagensFallback } from "./blingClient.js";
+import express from "express";
+import { buildAuthorizeUrl, patchProduct, putProductImages } from "./blingClient.js";
+import { buildSkeletonFromSeeds, parseBNAndNormalize } from "./services.js";
+import { exchangeCodeForToken, getStatus, refreshToken, requireAuth } from "./tokenStore.js";
+import { uuid } from "./utils.js";
 
-export const router = Router();
+const router = express.Router();
 
-router.get("/health", (_req, res) => res.json({ ok: true, service: "bling-updater-backend" }));
-
-router.get("/auth/start", (req, res) => {
-  const client_id = process.env.BLING_CLIENT_ID;
-  const redirect_uri = process.env.BLING_REDIRECT_URI;
-  const scope = process.env.BLING_SCOPE || "produtos";
-  if (!client_id || !redirect_uri) {
-    return res.status(500).send("Configure BLING_CLIENT_ID e BLING_REDIRECT_URI no Render.");
-  }
-  const state = crypto.randomUUID();
-  const url = new URL("https://www.bling.com.br/Api/v3/oauth/authorize");
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("client_id", client_id);
-  url.searchParams.set("redirect_uri", redirect_uri);
-  url.searchParams.set("scope", scope);
-  url.searchParams.set("state", state);
-  res.redirect(url.toString());
+// health
+router.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "bling-updater-backend" });
 });
 
+// OAuth start
+const stateMem = new Set<string>();
+router.get("/auth/start", (req, res) => {
+  const s = uuid();
+  stateMem.add(s);
+  const url = buildAuthorizeUrl(s);
+  res.redirect(url);
+});
+
+// OAuth callback
 router.get("/auth/callback", async (req, res) => {
   const code = String(req.query.code || "");
-  if (!code) return res.status(400).send("Faltou code");
-
-  const client_id = process.env.BLING_CLIENT_ID!;
-  const client_secret = process.env.BLING_CLIENT_SECRET!;
-  const redirect_uri = process.env.BLING_REDIRECT_URI!;
-
-  // Bling requer client credentials via Authorization: Basic
-  const basic = Buffer.from(`${client_id}:${client_secret}`).toString("base64");
-
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri
-    // NÃO enviar client_secret no body — eles querem no header Basic
-  });
-
-  const r = await fetch("https://www.bling.com.br/Api/v3/oauth/token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Authorization": `Basic ${basic}`
-    },
-    body
-  });
-
-  const j: any = await r.json().catch(() => ({}));
-  if (!r.ok || !j.access_token) {
-    return res.status(400).json({ ok: false, error: j });
+  const state = String(req.query.state || "");
+  try {
+    if (!stateMem.has(state)) throw new Error("invalid_state");
+    stateMem.delete(state);
+    await exchangeCodeForToken(code);
+    const back = process.env.FRONTEND_URL || "/";
+    res.redirect(back);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: { message: e?.message || "auth_error" } });
   }
-
-  const expires_at = Math.floor(Date.now() / 1000) + (Number(j.expires_in ?? 3600) - 60);
-  setTokenBundle({
-    access_token: j.access_token,
-    refresh_token: j.refresh_token,
-    expires_at,
-    scope: j.scope,
-  });
-
-  const front = process.env.FRONTEND_URL || "https://imagens.japanbrinquedos.com.br/japan-brinquedos/";
-  res.redirect(front);
 });
 
-router.get("/auth/status", async (_req, res) => res.json({ ok: true, ...getStatus() }));
+// status
+router.get("/auth/status", (_req, res) => {
+  res.json(getStatus());
+});
 
+// manual refresh
 router.post("/auth/refresh", async (_req, res) => {
-  const t = await ensureFreshAccessToken();
-  if (!t) return res.status(400).json({ ok: false, error: "Sem token para refresh" });
-  res.json({ ok: true, ...getStatus() });
+  try {
+    const st = await refreshToken();
+    res.json(st);
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e?.message || "refresh_error" });
+  }
 });
 
-// Preview
+// Preview BN
 router.post("/bling/preview", (req, res) => {
   try {
-    const body = req.body || {};
-    const txt = typeof body.bn === "string" ? body.bn : body.text;
-    if (!txt) return res.status(400).json({ ok: false, error: { message: "Body.bn (ou text) é obrigatório" } });
-    const parsed = parseBNAndNormalize(txt);
-    return res.json({ ok: true, ...parsed });
+    const bn: string = String(req.body?.bn ?? "");
+    const parsed = parseBNAndNormalize(bn);
+    res.json({ ok: true, ...parsed });
   } catch (e: any) {
-    return res.status(500).json({ ok: false, error: { message: e?.message || "Erro" } });
+    res.status(400).json({ ok: false, error: e?.message || "preview_error" });
   }
 });
 
-// PATCH parcial por ID + imagens (replace best-effort)
+// PATCH (parcial) + PUT imagens (se houver)
 router.post("/bling/patch", requireAuth, async (req, res) => {
-  const accessToken: string = (req as any).accessToken;
-  try {
-    const bodyIn = req.body || {};
-    const txt = typeof bodyIn.bn === "string" ? bodyIn.bn : bodyIn.text;
-    if (!txt) return res.status(400).json({ ok: false, error: { message: "Body.bn (ou text) é obrigatório" } });
+  const bn: string = String(req.body?.bn ?? "");
+  const idem = (req.header("Idempotency-Key") || uuid()).toString();
 
-    const parsed = parseBNAndNormalize(txt);
-    const item = parsed.items[0];
-    if (!item?.id) return res.status(400).json({ ok: false, error: { message: "ID (col.1) é obrigatório" } });
+  const parsed = parseBNAndNormalize(bn);
+  const results: any[] = [];
+  const failures: any[] = [];
 
-    const idem = (req.headers["idempotency-key"] as string) || crypto.randomUUID();
-    const patchBody = toBlingPatchBody(item.patchPayload);
-
-    const r1 = await patchProdutoById(accessToken, item.id, patchBody, idem);
-
-    let imagesResult: any = { skipped: true };
-    if (item.images?.length) {
-      try {
-        imagesResult = await putImagensReplace(accessToken, item.id, item.images, crypto.randomUUID());
-      } catch (err1: any) {
-        try {
-          imagesResult = await patchProdutoImagensFallback(accessToken, item.id, item.images, crypto.randomUUID());
-        } catch (err2: any) {
-          imagesResult = { skipped: true, error: err2?.data ?? err1?.data ?? "imagens failed" };
-        }
-      }
+  for (const it of parsed.items) {
+    const id = String(it.id || "").trim();
+    if (!id) {
+      failures.push({ id: null, error: "missing_id" });
+      continue;
     }
+    try {
+      // PATCH parcial — enviar SOMENTE as chaves presentes
+      const patchPayload = it.patchPayload || {};
+      const patchResp = await patchProduct(id, patchPayload, idem);
 
-    return res.json({ ok: true, patch: r1, images: imagesResult, preview: parsed });
+      let imagesResp: any = undefined;
+      if (Array.isArray(it.images) && it.images.length > 0) {
+        // Replace de imagens SÓ se o BN vier com imagens
+        imagesResp = await putProductImages(id, it.images, idem);
+      }
+
+      results.push({
+        id,
+        idempotencyKey: idem,
+        patch: { status: "ok", response: patchResp },
+        images: imagesResp ? { status: "ok", count: it.images.length, response: imagesResp } : undefined,
+        warnings: it.warnings
+      });
+    } catch (e: any) {
+      failures.push({
+        id,
+        idempotencyKey: idem,
+        error: { status: e?.status || 500, message: e?.message || "patch_failed", payload: e?.payload }
+      });
+    }
+  }
+
+  res.status(failures.length ? 207 : 200).json({
+    ok: failures.length === 0,
+    idempotencyKey: idem,
+    results,
+    failures,
+    preview: { errors: parsed.errors }
+  });
+});
+
+// Buscar & Montar — esqueleto 22 colunas
+router.post("/bling/skeleton", (req, res) => {
+  try {
+    const seeds: string = String(req.body?.seeds ?? "");
+    const lines = buildSkeletonFromSeeds(seeds);
+    res.json({ ok: true, lines });
   } catch (e: any) {
-    const status = e?.status || e?.response?.status || 500;
-    return res.status(status).json({ ok: false, error: e?.data || e?.response?.data || { message: e?.message || "Erro" } });
+    res.status(400).json({ ok: false, error: e?.message || "skeleton_error" });
   }
 });
 

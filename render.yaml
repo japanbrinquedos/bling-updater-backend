@@ -4,6 +4,9 @@ services:
     env: node
     plan: free
     buildCommand: "npm install && npm run build"
-    startCommand: "node dist/server.js"
-    healthCheckPath: "/health"
-    autoDeploy: true
+    startCommand: "npm start"
+    envVars:
+      - key: NODE_VERSION
+        value: 20.14.0
+      - key: PORT
+        value: 10000
