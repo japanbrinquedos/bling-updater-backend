@@ -1,4 +1,4 @@
-import { getAccessToken } from "./tokenStore.js";
+import { getAccessToken } from "./tokenBridge.js";
 import { blingGetProduct, blingFindByCodeOrEan, blingPatchProduct, blingPutImages } from "./blingClient.js";
 
 type PreviewItem = {
