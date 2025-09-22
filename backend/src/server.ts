@@ -1,38 +1,52 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
+
+// Se o seu routes.ts exporta `router` como named export:
 import { router } from "./routes.js";
-import { authRouter } from "./auth/index.js";
 
 const app = express();
 
-// CORS baseado no seu env existente
-const allow = (process.env.CORS_ALLOW_ORIGINS || "")
+// Body parsers
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+/**
+ * CORS: defina CORS_ALLOW_ORIGINS="https://seu-front1,https://seu-front2"
+ * ou FRONTEND_ORIGIN="https://seu-front"
+ */
+const allowList = (
+  process.env.CORS_ALLOW_ORIGINS ||
+  process.env.FRONTEND_ORIGIN ||
+  ""
+)
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // mesma origem / curl
-      if (allow.length === 0 || allow.includes(origin)) return cb(null, true);
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // healthcheck interno, curl, etc.
+      if (allowList.length === 0 || allowList.includes(origin)) {
+        return cb(null, true);
+      }
       return cb(null, false);
     },
     credentials: true,
   })
 );
 
-// Parser JSON
-app.use(express.json({ limit: "5mb" }));
+// Health & raiz (Render usa isso no healthcheck)
+app.get("/", (_req, res) => res.send("OK"));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Auth isolado (mantém /auth/start, /auth/callback, /auth/status, /auth/logout)
-app.use("/auth", authRouter);
-
-// Demais rotas da aplicação
+// Suas rotas de auth/patch/etc.
 app.use(router);
 
-// Liveness
-const port = process.env.PORT ? Number(process.env.PORT) : 10000;
-app.listen(port, () => {
-  console.log(`Backend up on :${port}`);
+const PORT = Number(process.env.PORT || 10000);
+
+// Bind em 0.0.0.0 é importante no Render
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend up on 0.0.0.0:${PORT}`);
 });

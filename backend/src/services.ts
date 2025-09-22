@@ -1,276 +1,242 @@
-import { v4 as uuid } from "uuid";
-import { blingPatch } from "./blingClient.js";
+// backend/src/services.ts
+import { randomUUID } from "crypto";
 
-/** --------- Helpers de parsing/normalização --------- */
-
-const trimOuterQuotesAndStars = (s: string) => {
-  let out = s.trim();
-  // tira aspas globais
-  if ((out.startsWith('"') && out.endsWith('"')) || (out.startsWith("'") && out.endsWith("'"))) {
-    out = out.slice(1, -1);
-  }
-  // tira * globais
-  if (out.startsWith("*")) out = out.slice(1);
-  if (out.endsWith("*")) out = out.slice(0, -1);
-  return out.trim();
-};
-
-const isNumLike = (s: string) => /^[\s\-+]?\d{1,3}(\.\d{3})*(,\d+)?$|^[\s\-+]?\d+([.,]\d+)?$/.test(s.trim());
-
-const toNumber = (s: string): number | undefined => {
-  const raw = (s ?? "").toString().trim();
-  if (!raw) return undefined;
-  if (!isNumLike(raw)) return undefined;
-  const normalized = raw.replace(/\./g, "").replace(/,/g, ".");
-  const n = Number(normalized);
+/** Util: normaliza vírgula decimal para ponto */
+function toNum(x?: string) {
+  if (!x) return undefined;
+  const s = x.replace(/\./g, "").replace(",", ".").replace(/\s+/g, "");
+  const n = Number(s);
   return Number.isFinite(n) ? n : undefined;
-};
-
-const toOneDecimal = (n: number | undefined) =>
-  typeof n === "number" && Number.isFinite(n) ? Math.round(n * 10) / 10 : undefined;
-
-const onlyDigits = (s: string) => (s ?? "").replace(/\D+/g, "");
-
-const toStatus = (s: string): "A" | "I" | undefined => {
-  const t = (s ?? "").toString().trim().toLowerCase();
-  if (!t) return undefined;
-  if (t === "a" || t === "ativo" || t === "active") return "A";
-  if (t === "i" || t === "inativo" || t === "inactive") return "I";
-  return undefined;
-};
-
-type PreviewItem = {
-  input: string;
-  cleaned: string;
-  bnLine: string;
-  warnings: string[];
-  patchPayload: any;
-};
-
-type Preview = {
-  cleaned_lines: string[];
-  errors: string[];
-  items: PreviewItem[];
-};
-
-const joinSpaces = (s: string) => s.replace(/\s+/g, " ").trim();
-
-/**
- * Divide o input em blocos *...* (resistente a quebras de linha dentro).
- * Se não houver '*', trata como um único bloco (linha única).
- */
-const splitBlocks = (raw: string): string[] => {
-  const txt = (raw ?? "").toString().replace(/\r/g, "");
-  const blocks: string[] = [];
-  let buf = "";
-  let open = false;
-  for (const ch of txt) {
-    if (ch === "*") {
-      if (!open) {
-        // abrindo
-        buf = "*";
-        open = true;
-      } else {
-        // fechando
-        buf += "*";
-        blocks.push(buf);
-        buf = "";
-        open = false;
-      }
-    } else {
-      if (open) buf += ch;
-    }
-  }
-  // fallback: se não teve *…*
-  if (blocks.length === 0) {
-    const line = txt.trim();
-    if (line) blocks.push(line);
-  }
-  return blocks;
-};
-
-/** --------- Parsing principal --------- */
-
-/**
- * parseBNAndNormalize:
- * - limpa cada bloco
- * - normaliza \t->| e preserva vazios
- * - garante 22 colunas e captura imagens extras
- * - monta preview e payload de PATCH (parcial)
- */
-export function parseBNAndNormalize(raw: string): Preview {
-  const errors: string[] = [];
-  const cleaned_lines: string[] = [];
-  const items: PreviewItem[] = [];
-
-  const blocks = splitBlocks(raw);
-  for (const original of blocks) {
-    if (!original.trim()) continue;
-
-    // 1) limpar * e aspas externas
-    let cleaned = trimOuterQuotesAndStars(original);
-
-    // 2) normalizar tabs para pipe e comprimir espaços ao redor
-    cleaned = cleaned.replace(/\t/g, "|");
-    // não mexer no HTML interno, só higienizar múltiplos espaços fora dos pipes
-    // (na prática, o split por '|' preserva vazios)
-    // 3) montar array de colunas preservando vazios
-    const fields = cleaned.split("|").map((x) => x); // sem trim agressivo agora
-
-    // 4) garantir mínimo de 22 colunas (preenche vazios sem deslocar)
-    while (fields.length < 22) fields.push("");
-
-    // 5) imagens extras (22ª em diante). A 22ª (idx 21) é a primeira URL, extras = idx >= 22
-    const imgStart = 21;
-    const extraImages = fields.slice(22).filter(Boolean);
-    // reconstruir linha BN "canônica" para debug (mantém 22 primeiras + imagens extras separados por vírgula)
-    const canonicalImages = [fields[imgStart] ?? "", ...extraImages].filter(Boolean).join(",");
-
-    // 6) mapear colunas (índices 0..21)
-    // Convenção das 22 colunas acordadas:
-    // 0 ID, 1 Código, 2 Nome, 3 Unidade, 4 NCM, 5 Preço, 6 Situação, 7 Preço custo,
-    // 8 Cód fornecedor, 9 Fornecedor (NÃO enviar), 10 Peso líquido, 11 Peso bruto,
-    // 12 EAN, 13 Largura, 14 Altura, 15 Profundidade,
-    // 16 Tags (NÃO enviar), 17 Código Pai (NÃO enviar), 18 Marca, 19 Volumes,
-    // 20 Descrição curta (HTML permitido), 21 URL Imagens (primeira)
-    const F = (i: number) => (fields[i] ?? "").toString();
-
-    const id = F(0).trim();
-    const code = F(1).trim();
-    const name = joinSpaces(F(2));
-    const unit = F(3).trim() || "UN";
-    const ncmDigits = onlyDigits(F(4));
-    const price = toNumber(F(5));
-    const status = toStatus(F(6));
-    const costPrice = toNumber(F(7));
-    const supplierCode = F(8).trim(); // NÃO remover — mas só envia se houver
-    // F(9) fornecedor -> NÃO enviar
-
-    const netWeight = toOneDecimal(toNumber(F(10)));
-    const grossWeight = toOneDecimal(toNumber(F(11)));
-    const ean = onlyDigits(F(12));
-    const width = toOneDecimal(toNumber(F(13)));
-    const height = toOneDecimal(toNumber(F(14)));
-    const depth = toOneDecimal(toNumber(F(15)));
-    // F(16) tags -> NÃO enviar
-    // F(17) código pai -> NÃO enviar
-    const brand = F(18).trim().toUpperCase();
-    const volumes = toNumber(F(19));
-    const shortDescription = F(20); // manter HTML
-    const firstImage = (F(21) || "").trim();
-    const images = [firstImage, ...extraImages].filter(Boolean);
-
-    // 7) validações brandas
-    const warns: string[] = [];
-    if (!id) {
-      errors.push("Linha sem ID (coluna 1) — será ignorada no PATCH.");
-    }
-    if (ncmDigits && ncmDigits.length !== 8) {
-      warns.push("ncm_invalid_digits: NCM deve ter 8 dígitos; mantendo como enviado.");
-    }
-    // limites de dimensão (0.5–200) se existirem
-    const inRange = (n?: number) => (typeof n === "number" ? n >= 0.5 && n <= 200 : true);
-    if (!inRange(width) || !inRange(height) || !inRange(depth)) {
-      warns.push("dims_out_of_range: dimensões fora de [0,5–200] cm; mantendo como enviado.");
-    }
-
-    // 8) montar payload parcial (só com o que veio populado)
-    const body: any = {};
-    const set = (k: string, v: any) => {
-      if (v === undefined) return;
-      if (typeof v === "string" && v.trim() === "") return;
-      body[k] = v;
-    };
-
-    set("code", code);
-    set("name", name);
-    set("unit", unit);
-    if (ncmDigits) set("ncm", ncmDigits); // só envia se veio válido
-    set("price", price);
-    set("status", status); // "A" / "I"
-    set("cost_price", costPrice);
-    set("supplier_code", supplierCode);
-    set("net_weight", netWeight);
-    set("gross_weight", grossWeight);
-    if (ean) set("ean", ean);
-    set("width_cm", width);
-    set("height_cm", height);
-    set("depth_cm", depth);
-    set("brand", brand);
-    set("volumes", volumes);
-    // mantém HTML
-    set("short_description", shortDescription);
-    // imagens: só envia se houver ao menos uma
-    if (images.length > 0) set("images", images);
-
-    // 9) linha BN “limpa” para exibir no preview (22 colunas + imagens em CSV)
-    const first22 = fields.slice(0, 22);
-    first22[21] = canonicalImages; // substitui col 22 pela lista consolidada
-    const bnLine = first22.join("|");
-
-    cleaned_lines.push(bnLine);
-
-    items.push({
-      input: original,
-      cleaned,
-      bnLine,
-      warnings: warns,
-      patchPayload: body,
-    });
-  }
-
-  return { cleaned_lines, errors, items };
 }
 
-/** --------- PATCH em lote a partir do BN --------- */
-export async function patchFromBN(raw: string) {
-  const preview = parseBNAndNormalize(raw);
-  const idempotencyKey = uuid();
+/** Remove * e aspas ao redor; normaliza \t -> |; colapsa espaços; preserva HTML */
+export function sanitizeRawRecord(raw: string): string {
+  let s = raw.trim();
 
-  const results: any[] = [];
-  const failures: any[] = [];
+  // recorta entre * ... * se houver
+  if ((s.match(/\*/g) || []).length >= 2) {
+    const first = s.indexOf("*");
+    const last = s.lastIndexOf("*");
+    s = s.slice(first + 1, last);
+  }
 
-  for (const it of preview.items) {
-    // extrair ID da primeira coluna da linha BN reconstruída
-    const id = (it.bnLine.split("|")[0] || "").trim();
-    if (!id) {
-      failures.push({
-        id: null,
-        idempotencyKey,
-        error: { status: 400, message: "missing_id" },
-      });
-      continue;
+  // remove aspas únicas ao redor
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+
+  // tabs -> pipe
+  s = s.replace(/\t/g, "|");
+
+  // normaliza espaços em torno dos pipes, mas sem tocar em HTML
+  s = s
+    .split("|")
+    .map((chunk) => chunk.replace(/\s+/g, " ").trim())
+    .join("|");
+
+  return s;
+}
+
+/** Quebra texto do textarea em registros BN.
+ *  Aceita:
+ *  - bloco com *...* (HTML multiline no meio)
+ *  - ou uma linha por registro (sem *)
+ */
+export function extractRecords(rawTextarea: string): string[] {
+  const txt = rawTextarea.replace(/\r/g, "");
+
+  // Caso haja muitos asteriscos, dividir por eles e filtrar trechos com '|'
+  if (txt.includes("*")) {
+    return txt
+      .split("*")
+      .map((s) => s.trim())
+      .filter((s) => s.includes("|"))
+      .map((s) => sanitizeRawRecord(`*${s}*`));
+  }
+
+  // fallback: uma linha por registro
+  return txt
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length)
+    .map(sanitizeRawRecord);
+}
+
+/** Sempre retorna exatamente 22 colunas (+ imagens extras após 22) */
+export function splitBNKeeping22(line: string) {
+  const parts = line.split("|"); // preserva vazios do meio; trailing vazios podem sumir
+  // garante pelo menos 22 posições
+  while (parts.length < 22) parts.push("");
+
+  // tudo além da 22 é imagem extra (se for URL)
+  const base22 = parts.slice(0, 22);
+  const extras = parts.slice(22);
+
+  return { cols: base22, extras };
+}
+
+export type PreviewItem = {
+  id: string;
+  cleaned: string; // linha BN “normalizada” (22 colunas + imagens extras agregadas na col 22 por vírgula)
+  warnings: string[];
+  patch: any; // corpo do PATCH (parcial)
+};
+
+const STATUS_MAP: Record<string, "A" | "I"> = {
+  ativo: "A",
+  inativo: "I",
+};
+
+function isUrl(s: string) {
+  return /^https?:\/\/\S+/i.test(s || "");
+}
+
+/** Monta array de imagens a partir da col 22 + extras (pipe) e vírgulas dentro da col 22 */
+function collectImages(col22: string, extras: string[]) {
+  const imgs: string[] = [];
+
+  const seed = (col22 || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  for (const u of seed) if (isUrl(u)) imgs.push(u);
+  for (const e of extras) if (isUrl(e)) imgs.push(e);
+
+  // remove duplicadas preservando ordem
+  return Array.from(new Set(imgs));
+}
+
+/** Constrói o corpo de PATCH respeitando os contratos: parcial, não toca fornecedor, tags, código pai */
+export function buildPatchFromCols(cols: string[], extras: string[]): { id: string; body: any; warnings: string[] } {
+  const warnings: string[] = [];
+
+  // Colunas (base no seu BN)
+  const [
+    col01_id,
+    col02_code,
+    col03_name,
+    col04_unit,
+    col05_ncm,
+    col06_price,
+    col07_statusText,
+    col08_cost,
+    _col09_supplierCode, // NÃO ALTERAR
+    _col10_supplierName, // NÃO ALTERAR
+    col11_netWeight,
+    col12_grossWeight,
+    col13_ean,
+    col14_width,
+    col15_height,
+    col16_depth,
+    _col17_skip, // reservado
+    _col18_tags, // NÃO ALTERAR (Grupo de Tags/Tags)
+    col19_brand,
+    col20_volumes,
+    col21_shortHtml, // manter HTML
+    col22_imagesSeed,
+  ] = cols;
+
+  const id = (col01_id || "").replace(/\D/g, ""); // só dígitos; evita confundir com HTML acidental
+  if (!id) warnings.push("id_vazio: ID (coluna 1) não encontrado.");
+
+  const body: any = {};
+
+  // Atualizações parciais — só envia se houver valor útil
+  if (col02_code?.trim()) body.code = col02_code.trim();
+  if (col03_name?.trim()) body.name = col03_name.trim();
+  if (col04_unit?.trim()) body.unit = col04_unit.trim();
+
+  // NCM: aceita 8 dígitos. Remove pontuação.
+  if (col05_ncm?.trim()) {
+    const ncm = col05_ncm.replace(/\D/g, "");
+    if (ncm && ncm.length === 8) {
+      body.ncm = ncm;
+    } else {
+      warnings.push("ncm_invalido: mantendo original no Bling.");
     }
+  }
 
+  const price = toNum(col06_price);
+  if (price !== undefined) body.price = price;
+
+  const statusRaw = (col07_statusText || "").toLowerCase().trim();
+  if (statusRaw) {
+    const s = STATUS_MAP[statusRaw] ?? (statusRaw.startsWith("a") ? "A" : statusRaw.startsWith("i") ? "I" : undefined);
+    if (s) body.status = s;
+  }
+
+  const cost = toNum(col08_cost);
+  if (cost !== undefined) body.cost_price = cost;
+
+  const netW = toNum(col11_netWeight);
+  if (netW !== undefined) body.net_weight = netW;
+
+  const grossW = toNum(col12_grossWeight);
+  if (grossW !== undefined) body.gross_weight = grossW;
+
+  if (col13_ean?.trim()) body.ean = col13_ean.trim();
+
+  const width = toNum(col14_width);
+  if (width !== undefined) body.width_cm = width;
+
+  const height = toNum(col15_height);
+  if (height !== undefined) body.height_cm = height;
+
+  const depth = toNum(col16_depth);
+  if (depth !== undefined) body.depth_cm = depth;
+
+  // col18 (tags) — **não enviar**
+  if (col19_brand?.trim()) body.brand = col19_brand.trim();
+
+  const volumes = toNum(col20_volumes);
+  if (volumes !== undefined) body.volumes = volumes;
+
+  // Descrição curta (HTML **preservado**)
+  if (col21_shortHtml?.trim()) body.short_description = col21_shortHtml.trim();
+
+  // Imagens
+  const images = collectImages(col22_imagesSeed, extras);
+  if (images.length) {
+    body.images = images;
+  }
+
+  return { id, body, warnings };
+}
+
+export function previewRecords(rawTextarea: string) {
+  const errors: string[] = [];
+  const items: PreviewItem[] = [];
+
+  const records = extractRecords(rawTextarea);
+  for (const rec of records) {
     try {
-      // PATCH parcial no produto pelo ID
-      const resp = await blingPatch(id, it.patchPayload, { idempotencyKey });
-      results.push({
+      const { cols, extras } = splitBNKeeping22(rec);
+
+      // Normaliza uma "linha BN" legível para exibir no preview (agrega imagens extras por vírgula)
+      const normalizedLine = (() => {
+        const copy = [...cols];
+        const imgs = collectImages(cols[21], extras);
+        copy[21] = imgs.join(",");
+        return copy.join("|");
+      })();
+
+      const { id, body, warnings } = buildPatchFromCols(cols, extras);
+      items.push({
         id,
-        idempotencyKey,
-        ok: true,
-        response: resp,
+        cleaned: normalizedLine,
+        warnings,
+        patch: body,
       });
     } catch (e: any) {
-      const status = e?.response?.status || e?.status || 500;
-      const payload = e?.response?.data || e?.payload || null;
-      failures.push({
-        id,
-        idempotencyKey,
-        error: {
-          status,
-          message: `bling_error ${status}: ${JSON.stringify(payload)}`,
-          payload,
-        },
-      });
+      errors.push(`parse_error: ${String(e?.message || e)}`);
     }
   }
 
   return {
-    ok: failures.length === 0,
-    idempotencyKey,
-    results,
-    failures,
-    preview: { errors: preview.errors },
+    idempotencyKey: randomUUID(),
+    errors,
+    items,
+    cleaned_lines: items.map((it) => it.cleaned),
   };
 }
