@@ -1,242 +1,209 @@
-// backend/src/services.ts
-import { randomUUID } from "crypto";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
-/** Util: normaliza vírgula decimal para ponto */
-function toNum(x?: string) {
-  if (!x) return undefined;
-  const s = x.replace(/\./g, "").replace(",", ".").replace(/\s+/g, "");
+/**
+ * Parser / normalizador da coluna BN (22 colunas) com salvaguardas:
+ * - Remove * e aspas no início/fim
+ * - Converte \t -> | (sem perder vazios)
+ * - Mantém vazios entre pipes
+ * - Converte vírgula decimal -> ponto APENAS para campos numéricos
+ * - Coluna 22 = imagens (aceita CSV). Qualquer coisa após a 22 vira imagem extra
+ * - NÃO envia Grupo de Tags/Tags (col. 17) nem Código Pai (col. 18)
+ * - Mantém HTML da descrição curta (col. 21)
+ */
+
+export type ParsedItem = {
+  id: string;
+  bnLine: string;
+  patchPayload: Record<string, any>;
+};
+
+export type ParseResult = {
+  cleaned_lines: string[];
+  items: ParsedItem[];
+  errors: string[];
+};
+
+const NUM = (v: string): number | undefined => {
+  if (!v) return undefined;
+  // troca vírgula decimal por ponto e remove espaços
+  const s = v.replace(/\s+/g, '').replace(',', '.');
   const n = Number(s);
   return Number.isFinite(n) ? n : undefined;
-}
+};
 
-/** Remove * e aspas ao redor; normaliza \t -> |; colapsa espaços; preserva HTML */
-export function sanitizeRawRecord(raw: string): string {
-  let s = raw.trim();
+const cleanNCM = (v: string): string | undefined => {
+  if (!v) return undefined;
+  const s = v.replace(/\D/g, '');
+  return s.length ? s : undefined;
+};
 
-  // recorta entre * ... * se houver
-  if ((s.match(/\*/g) || []).length >= 2) {
-    const first = s.indexOf("*");
-    const last = s.lastIndexOf("*");
-    s = s.slice(first + 1, last);
-  }
+const trimOrUndef = (v: string): string | undefined => {
+  const s = (v ?? '').trim();
+  return s ? s : undefined;
+};
 
-  // remove aspas únicas ao redor
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1);
-  }
+const normalizeLine = (line: string): string => {
+  let s = (line ?? '').trim();
 
-  // tabs -> pipe
-  s = s.replace(/\t/g, "|");
+  // remove aspas/asteriscos de borde
+  s = s.replace(/^[*"']+/, '').replace(/[*"']+$/, '');
 
-  // normaliza espaços em torno dos pipes, mas sem tocar em HTML
-  s = s
-    .split("|")
-    .map((chunk) => chunk.replace(/\s+/g, " ").trim())
-    .join("|");
+  // \t -> |
+  s = s.replace(/\t/g, '|');
+
+  // remove espaços ao redor de pipes (preserva vazios)
+  s = s.replace(/\s*\|\s*/g, '|');
 
   return s;
-}
-
-/** Quebra texto do textarea em registros BN.
- *  Aceita:
- *  - bloco com *...* (HTML multiline no meio)
- *  - ou uma linha por registro (sem *)
- */
-export function extractRecords(rawTextarea: string): string[] {
-  const txt = rawTextarea.replace(/\r/g, "");
-
-  // Caso haja muitos asteriscos, dividir por eles e filtrar trechos com '|'
-  if (txt.includes("*")) {
-    return txt
-      .split("*")
-      .map((s) => s.trim())
-      .filter((s) => s.includes("|"))
-      .map((s) => sanitizeRawRecord(`*${s}*`));
-  }
-
-  // fallback: uma linha por registro
-  return txt
-    .split("\n")
-    .map((s) => s.trim())
-    .filter((s) => s.length)
-    .map(sanitizeRawRecord);
-}
-
-/** Sempre retorna exatamente 22 colunas (+ imagens extras após 22) */
-export function splitBNKeeping22(line: string) {
-  const parts = line.split("|"); // preserva vazios do meio; trailing vazios podem sumir
-  // garante pelo menos 22 posições
-  while (parts.length < 22) parts.push("");
-
-  // tudo além da 22 é imagem extra (se for URL)
-  const base22 = parts.slice(0, 22);
-  const extras = parts.slice(22);
-
-  return { cols: base22, extras };
-}
-
-export type PreviewItem = {
-  id: string;
-  cleaned: string; // linha BN “normalizada” (22 colunas + imagens extras agregadas na col 22 por vírgula)
-  warnings: string[];
-  patch: any; // corpo do PATCH (parcial)
 };
 
-const STATUS_MAP: Record<string, "A" | "I"> = {
-  ativo: "A",
-  inativo: "I",
+const split22 = (s: string): { cols: string[]; extras: string[] } => {
+  const raw = s.split('|'); // preserva vazios
+  const cols: string[] = [];
+  for (let i = 0; i < 22; i++) cols.push(raw[i] ?? '');
+  const extras = raw.slice(22);
+  return { cols, extras };
 };
 
-function isUrl(s: string) {
-  return /^https?:\/\/\S+/i.test(s || "");
-}
-
-/** Monta array de imagens a partir da col 22 + extras (pipe) e vírgulas dentro da col 22 */
-function collectImages(col22: string, extras: string[]) {
-  const imgs: string[] = [];
-
-  const seed = (col22 || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  for (const u of seed) if (isUrl(u)) imgs.push(u);
-  for (const e of extras) if (isUrl(e)) imgs.push(e);
-
-  // remove duplicadas preservando ordem
-  return Array.from(new Set(imgs));
-}
-
-/** Constrói o corpo de PATCH respeitando os contratos: parcial, não toca fornecedor, tags, código pai */
-export function buildPatchFromCols(cols: string[], extras: string[]): { id: string; body: any; warnings: string[] } {
-  const warnings: string[] = [];
-
-  // Colunas (base no seu BN)
-  const [
-    col01_id,
-    col02_code,
-    col03_name,
-    col04_unit,
-    col05_ncm,
-    col06_price,
-    col07_statusText,
-    col08_cost,
-    _col09_supplierCode, // NÃO ALTERAR
-    _col10_supplierName, // NÃO ALTERAR
-    col11_netWeight,
-    col12_grossWeight,
-    col13_ean,
-    col14_width,
-    col15_height,
-    col16_depth,
-    _col17_skip, // reservado
-    _col18_tags, // NÃO ALTERAR (Grupo de Tags/Tags)
-    col19_brand,
-    col20_volumes,
-    col21_shortHtml, // manter HTML
-    col22_imagesSeed,
-  ] = cols;
-
-  const id = (col01_id || "").replace(/\D/g, ""); // só dígitos; evita confundir com HTML acidental
-  if (!id) warnings.push("id_vazio: ID (coluna 1) não encontrado.");
-
-  const body: any = {};
-
-  // Atualizações parciais — só envia se houver valor útil
-  if (col02_code?.trim()) body.code = col02_code.trim();
-  if (col03_name?.trim()) body.name = col03_name.trim();
-  if (col04_unit?.trim()) body.unit = col04_unit.trim();
-
-  // NCM: aceita 8 dígitos. Remove pontuação.
-  if (col05_ncm?.trim()) {
-    const ncm = col05_ncm.replace(/\D/g, "");
-    if (ncm && ncm.length === 8) {
-      body.ncm = ncm;
-    } else {
-      warnings.push("ncm_invalido: mantendo original no Bling.");
-    }
-  }
-
-  const price = toNum(col06_price);
-  if (price !== undefined) body.price = price;
-
-  const statusRaw = (col07_statusText || "").toLowerCase().trim();
-  if (statusRaw) {
-    const s = STATUS_MAP[statusRaw] ?? (statusRaw.startsWith("a") ? "A" : statusRaw.startsWith("i") ? "I" : undefined);
-    if (s) body.status = s;
-  }
-
-  const cost = toNum(col08_cost);
-  if (cost !== undefined) body.cost_price = cost;
-
-  const netW = toNum(col11_netWeight);
-  if (netW !== undefined) body.net_weight = netW;
-
-  const grossW = toNum(col12_grossWeight);
-  if (grossW !== undefined) body.gross_weight = grossW;
-
-  if (col13_ean?.trim()) body.ean = col13_ean.trim();
-
-  const width = toNum(col14_width);
-  if (width !== undefined) body.width_cm = width;
-
-  const height = toNum(col15_height);
-  if (height !== undefined) body.height_cm = height;
-
-  const depth = toNum(col16_depth);
-  if (depth !== undefined) body.depth_cm = depth;
-
-  // col18 (tags) — **não enviar**
-  if (col19_brand?.trim()) body.brand = col19_brand.trim();
-
-  const volumes = toNum(col20_volumes);
-  if (volumes !== undefined) body.volumes = volumes;
-
-  // Descrição curta (HTML **preservado**)
-  if (col21_shortHtml?.trim()) body.short_description = col21_shortHtml.trim();
-
-  // Imagens
-  const images = collectImages(col22_imagesSeed, extras);
-  if (images.length) {
-    body.images = images;
-  }
-
-  return { id, body, warnings };
-}
-
-export function previewRecords(rawTextarea: string) {
-  const errors: string[] = [];
-  const items: PreviewItem[] = [];
-
-  const records = extractRecords(rawTextarea);
-  for (const rec of records) {
-    try {
-      const { cols, extras } = splitBNKeeping22(rec);
-
-      // Normaliza uma "linha BN" legível para exibir no preview (agrega imagens extras por vírgula)
-      const normalizedLine = (() => {
-        const copy = [...cols];
-        const imgs = collectImages(cols[21], extras);
-        copy[21] = imgs.join(",");
-        return copy.join("|");
-      })();
-
-      const { id, body, warnings } = buildPatchFromCols(cols, extras);
-      items.push({
-        id,
-        cleaned: normalizedLine,
-        warnings,
-        patch: body,
-      });
-    } catch (e: any) {
-      errors.push(`parse_error: ${String(e?.message || e)}`);
-    }
-  }
-
-  return {
-    idempotencyKey: randomUUID(),
-    errors,
-    items,
-    cleaned_lines: items.map((it) => it.cleaned),
+const gatherImages = (col22: string, extras: string[]): string[] => {
+  const urls: string[] = [];
+  const pushCsv = (chunk: string) => {
+    chunk
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean)
+      .forEach((u) => urls.push(u));
   };
+  if (col22) pushCsv(col22);
+  if (extras?.length) {
+    extras
+      .map((x) => x?.trim())
+      .filter(Boolean)
+      .forEach((x) => pushCsv(x));
+  }
+  // filtra o que parece URL http/https
+  return urls.filter((u) => /^https?:\/\//i.test(u));
+};
+
+export function parseBNAndNormalize(lines: string[]): ParseResult {
+  const cleaned_lines: string[] = [];
+  const items: ParsedItem[] = [];
+  const errors: string[] = [];
+
+  (lines || []).forEach((raw, idx) => {
+    const norm = normalizeLine(raw);
+    if (!norm) return; // ignora linhas vazias
+
+    const { cols, extras } = split22(norm);
+
+    if (cols.length < 22) {
+      errors.push(`Linha ${idx + 1}: ${cols.length} colunas (<22)`);
+    }
+
+    // mapeamento por índice (1-baseado na documentação; aqui 0-baseado):
+    const id                 = cols[0];   // 1: ID (do Bling)
+    const code               = cols[1];   // 2: Código (SKU)
+    const name               = cols[2];   // 3: Nome
+    const unit               = cols[3];   // 4: Unidade
+    const ncmRaw             = cols[4];   // 5: NCM
+    const priceRaw           = cols[5];   // 6: Preço
+    const statusRaw          = cols[6];   // 7: Situação (Ativo/Inativo)
+    const costRaw            = cols[7];   // 8: Custo
+    // 9 e 10 = fornecedor (IGNORAR em PATCH conforme contrato)
+    const netWRaw            = cols[10];  // 11: Peso Líquido
+    const grossWRaw          = cols[11];  // 12: Peso Bruto
+    const ean                = cols[12];  // 13: EAN
+    const widthRaw           = cols[13];  // 14: Largura (cm)
+    const heightRaw          = cols[14];  // 15: Altura (cm)
+    const depthRaw           = cols[15];  // 16: Profundidade (cm)
+    // 17: Grupo de Tags/Tags (IGNORAR)
+    // 18: Código Pai (IGNORAR)
+    const brand              = cols[18];  // 19: Marca
+    const volumesRaw         = cols[19];  // 20: Volumes
+    const short_description  = cols[20];  // 21: Descrição curta (HTML permitido)
+    const imagesCol          = cols[21];  // 22: Imagens (CSV)
+
+    const ncm        = cleanNCM(ncmRaw) ?? undefined;
+    const price      = NUM(priceRaw);
+    const cost_price = NUM(costRaw);
+    const net_weight = NUM(netWRaw);
+    const gross_weight = NUM(grossWRaw);
+    const width_cm   = NUM(widthRaw);
+    const height_cm  = NUM(heightRaw);
+    const depth_cm   = NUM(depthRaw);
+    const volumes    = NUM(volumesRaw);
+    const status     = (statusRaw || '').toLowerCase().startsWith('ati') ? 'A' : 'I';
+
+    const images = gatherImages(imagesCol, extras);
+
+    // monta payload de PATCH (somente campos que podemos atualizar)
+    const payload: Record<string, any> = {};
+
+    // strings
+    if (trimOrUndef(code))  payload.code  = code.trim();
+    if (trimOrUndef(name))  payload.name  = name.trim();
+    if (trimOrUndef(unit))  payload.unit  = unit.trim();
+    if (trimOrUndef(ncm || '')) payload.ncm = ncm;
+    if (trimOrUndef(ean))   payload.ean   = ean.trim();
+    if (trimOrUndef(brand)) payload.brand = brand.trim();
+    if (trimOrUndef(short_description)) payload.short_description = short_description;
+
+    // status
+    if (status) payload.status = status; // 'A' ou 'I'
+
+    // números (só inclui se for número válido)
+    if (price !== undefined)        payload.price        = price;
+    if (cost_price !== undefined)   payload.cost_price   = cost_price;
+    if (net_weight !== undefined)   payload.net_weight   = net_weight;
+    if (gross_weight !== undefined) payload.gross_weight = gross_weight;
+    if (width_cm !== undefined)     payload.width_cm     = width_cm;
+    if (height_cm !== undefined)    payload.height_cm    = height_cm;
+    if (depth_cm !== undefined)     payload.depth_cm     = depth_cm;
+    if (volumes !== undefined)      payload.volumes      = volumes;
+
+    // imagens (se vierem, respeitamos a estratégia no blingClient.ts)
+    if (images.length) payload.images = images;
+
+    // ID é obrigatório para sync
+    const finalId = (id || '').trim();
+    if (!finalId) {
+      errors.push(`Linha ${idx + 1}: ID (coluna 1) ausente`);
+    }
+
+    // linha “limpa” só para debug/preview (mantém HTML na col. 21)
+    const cleaned = [
+      finalId,
+      code,
+      name,
+      unit,
+      ncm ?? '',
+      price !== undefined ? String(price) : '',
+      status,
+      cost_price !== undefined ? String(cost_price) : '',
+      '', // fornecedor cod (ignorado no PATCH)
+      '', // fornecedor nome (ignorado no PATCH)
+      net_weight !== undefined ? String(net_weight) : '',
+      gross_weight !== undefined ? String(gross_weight) : '',
+      ean,
+      width_cm !== undefined ? String(width_cm) : '',
+      height_cm !== undefined ? String(height_cm) : '',
+      depth_cm !== undefined ? String(depth_cm) : '',
+      '', // Grupo de Tags/Tags (ignorado)
+      '', // Código Pai (ignorado)
+      brand,
+      volumes !== undefined ? String(volumes) : '',
+      short_description,
+      images.join(','),
+    ].join('|');
+
+    cleaned_lines.push(cleaned);
+
+    items.push({
+      id: finalId,
+      bnLine: cleaned,
+      patchPayload: payload,
+    });
+  });
+
+  return { cleaned_lines, items, errors };
 }
