@@ -1,52 +1,44 @@
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
-
-// Se o seu routes.ts exporta `router` como named export:
-import { router } from "./routes.js";
+import cookieParser from "cookie-parser";
+import { router } from "./routes.js";           // suas rotas já existentes (patch, callback, status, etc.)
+import { registerAuthRoutes } from "./authBridge.js"; // /auth/start isolado aqui
 
 const app = express();
 
-// Body parsers
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+// Body parser
+app.use(express.json({ limit: "1mb" }));
 
-/**
- * CORS: defina CORS_ALLOW_ORIGINS="https://seu-front1,https://seu-front2"
- * ou FRONTEND_ORIGIN="https://seu-front"
- */
-const allowList = (
-  process.env.CORS_ALLOW_ORIGINS ||
-  process.env.FRONTEND_ORIGIN ||
-  ""
-)
+// Cookies (necessário pro STATE)
+app.use(cookieParser());
+
+// CORS
+const allow = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 app.use(
   cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true); // healthcheck interno, curl, etc.
-      if (allowList.length === 0 || allowList.includes(origin)) {
-        return cb(null, true);
-      }
+    origin: (origin, cb) => {
+      if (!origin || allow.length === 0 || allow.includes(origin)) return cb(null, true);
       return cb(null, false);
     },
     credentials: true,
   })
 );
 
-// Health & raiz (Render usa isso no healthcheck)
-app.get("/", (_req, res) => res.send("OK"));
+// Health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Suas rotas de auth/patch/etc.
+// Auth (/auth/start somente)
+registerAuthRoutes(app);
+
+// Suas demais rotas
 app.use(router);
 
+// Start
 const PORT = Number(process.env.PORT || 10000);
-
-// Bind em 0.0.0.0 é importante no Render
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend up on 0.0.0.0:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`Backend up on :${PORT}`);
 });
